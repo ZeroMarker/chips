@@ -1,0 +1,8 @@
+[package]
+name = "chips"
+version = "0.1.0"
+edition = "2021"
+description = "RISC-V functional model (Track A) — software golden reference for the RISC-V chip project"
+license = "MIT"
+
+[dependencies]
