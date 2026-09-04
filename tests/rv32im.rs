@@ -1,7 +1,7 @@
-//! Integration tests that hand-assemble RV32IM instruction words and check the
-//! functional model executes them correctly.
+//! Integration tests that hand-assemble RV32IMZicsr instruction words and
+//! check the functional model executes them correctly.
 
-use chips::cpu::{Cpu, StopReason};
+use chips::cpu::{Cpu, StopReason, Trap};
 use chips::mem::Memory;
 
 /// Load a run of little-endian instruction words at `base`.
@@ -139,4 +139,93 @@ fn m_mul_div_rem() {
     assert_eq!(cpu.reg(10), (-6i32) as u32, "x10 = -20 / 3 = -6");
     assert_eq!(cpu.reg(11), (-2i32) as u32, "x11 = -20 % 3 = -2");
     assert_eq!(cpu.reg(12), u32::MAX, "x12 = 0 / 0 -> all ones");
+}
+
+#[test]
+fn alternate_alu_encodings_sub_and_sra() {
+    let prog = [
+        0x0070_0293, // addi x5, x0, 7
+        0x00A0_0313, // addi x6, x0, 10
+        0x4053_03B3, // sub  x7, x6, x5 -> 3
+        0xFFD0_0413, // addi x8, x0, -3
+        0x4054_54B3, // sra  x9, x8, x5 -> -1
+        0x0010_0073, // ebreak
+    ];
+    let base = 0x6000;
+    let mut mem = Memory::new();
+    load_words(&mut mem, base, &prog);
+    let mut cpu = Cpu::new();
+    cpu.set_pc(base);
+
+    assert_eq!(cpu.run(&mut mem, 100), Ok(StopReason::Ebreak));
+    assert_eq!(cpu.reg(7), 3);
+    assert_eq!(cpu.reg(9), u32::MAX);
+}
+
+#[test]
+fn zicsr_register_and_immediate_operations() {
+    // Exercise all six Zicsr operations against mscratch (CSR 0x340).
+    let prog = [
+        0x00A0_0293, // addi   x5, x0, 10
+        0x3402_9073, // csrrw  x0, mscratch, x5
+        0x3400_2373, // csrrs  x6, mscratch, x0 (pure read)
+        0x0050_0393, // addi   x7, x0, 5
+        0x3403_A473, // csrrs  x8, mscratch, x7
+        0x3403_B4F3, // csrrc  x9, mscratch, x7
+        0x3402_D573, // csrrwi x10, mscratch, 5
+        0x3401_E5F3, // csrrsi x11, mscratch, 3
+        0x3401_F673, // csrrci x12, mscratch, 3
+        0x3400_26F3, // csrrs  x13, mscratch, x0
+        0x0010_0073, // ebreak
+    ];
+    let base = 0x7000;
+    let mut mem = Memory::new();
+    load_words(&mut mem, base, &prog);
+    let mut cpu = Cpu::new();
+    cpu.set_pc(base);
+
+    assert_eq!(cpu.run(&mut mem, 100), Ok(StopReason::Ebreak));
+    assert_eq!(cpu.reg(6), 10, "csrrs reads the initial value");
+    assert_eq!(
+        cpu.reg(8),
+        10,
+        "csrrs returns the value before setting bits"
+    );
+    assert_eq!(
+        cpu.reg(9),
+        15,
+        "csrrc returns the value before clearing bits"
+    );
+    assert_eq!(cpu.reg(10), 10, "csrrwi returns the replaced value");
+    assert_eq!(
+        cpu.reg(11),
+        5,
+        "csrrsi returns the value before setting bits"
+    );
+    assert_eq!(
+        cpu.reg(12),
+        7,
+        "csrrci returns the value before clearing bits"
+    );
+    assert_eq!(cpu.reg(13), 4, "final mscratch value");
+}
+
+#[test]
+fn zicsr_rejects_writes_to_read_only_csrs() {
+    let base = 0x8000;
+    let mut mem = Memory::new();
+    load_words(
+        &mut mem,
+        base,
+        &[
+            0xC000_22F3, // csrrs x5, cycle, x0 (pure read is legal)
+            0xC000_1073, // csrrw x0, cycle, x0 (write is illegal)
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.set_pc(base);
+
+    assert_eq!(cpu.step(&mut mem), Ok(chips::cpu::StepOutcome::Continue));
+    assert_eq!(cpu.step(&mut mem), Err(Trap::IllegalInstruction(base + 4)));
+    assert_eq!(cpu.pc(), base + 4, "a trapped instruction must not retire");
 }

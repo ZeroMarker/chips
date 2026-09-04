@@ -1,4 +1,5 @@
-//! RISC-V ISA constants, register definitions, and RV32IM instruction decoding.
+//! RISC-V ISA constants, register definitions, and RV32IMZicsr instruction
+//! decoding.
 //!
 //! Encoding is little-endian 32-bit. Utilities here are shared by the CPU
 //! execute loop and the instruction-level tests.

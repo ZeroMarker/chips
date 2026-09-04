@@ -1,5 +1,5 @@
-//! Minimal command-line driver: load a raw binary image, run it, and dump the
-//! final register state.
+//! Minimal RV32IMZicsr command-line driver: load a raw binary image, run it,
+//! and dump the final register state.
 //!
 //! Usage: `chips <image.bin> [start_addr]`
 //! - `image.bin`: raw instruction bytes (e.g. produced by linking a bare-metal

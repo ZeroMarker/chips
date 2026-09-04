@@ -1,4 +1,4 @@
-//! CPU state and the RV32IM execute loop.
+//! CPU state and the RV32IMZicsr execute loop.
 //!
 //! `Cpu` owns the program counter, the integer register file, and a CSR
 //! container. `step` fetches, decodes, and executes one instruction against
@@ -34,9 +34,10 @@ pub enum StopReason {
 /// A trap raised while executing an instruction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Trap {
-    /// The opcode is not recognized as a valid RV32IM instruction.
+    /// The instruction at the given program counter is not a valid RV32IMZicsr
+    /// instruction.
     IllegalInstruction(u32),
-    /// A recognized-but-unimplemented extension (CSR, atomics, FP, etc.).
+    /// A recognized-but-unimplemented extension (atomics, FP, etc.).
     Unsupported(&'static str),
 }
 
@@ -162,32 +163,20 @@ impl Cpu {
                 let b = self.x(rs2);
                 let val = if funct7 == isa::M_FUNCT7 {
                     muldiv(a, b, funct3)
-                } else if funct7 == 0 {
-                    match funct3 {
-                        0b000 => {
-                            if (raw >> 30) & 1 == 1 {
-                                a.wrapping_sub(b) // sub
-                            } else {
-                                a.wrapping_add(b) // add
-                            }
-                        }
-                        0b001 => a.checked_shl(b & 0x1f).unwrap_or(0), // sll
-                        0b010 => ((a as i32) < (b as i32)) as u32,     // slt
-                        0b011 => (a < b) as u32,                       // sltu
-                        0b100 => a ^ b,                                // xor
-                        0b101 => {
-                            if (raw >> 30) & 1 == 1 {
-                                ((a as i32) >> (b & 0x1f)) as u32 // sra
-                            } else {
-                                a >> (b & 0x1f) // srl
-                            }
-                        }
-                        0b110 => a | b, // or
-                        0b111 => a & b, // and
+                } else {
+                    match (funct7, funct3) {
+                        (0, 0b000) => a.wrapping_add(b),
+                        (isa::ALT_FUNCT7, 0b000) => a.wrapping_sub(b),
+                        (0, 0b001) => a << (b & 0x1f),
+                        (0, 0b010) => ((a as i32) < (b as i32)) as u32,
+                        (0, 0b011) => (a < b) as u32,
+                        (0, 0b100) => a ^ b,
+                        (0, 0b101) => a >> (b & 0x1f),
+                        (isa::ALT_FUNCT7, 0b101) => ((a as i32) >> (b & 0x1f)) as u32,
+                        (0, 0b110) => a | b,
+                        (0, 0b111) => a & b,
                         _ => return Err(Trap::IllegalInstruction(pc)),
                     }
-                } else {
-                    return Err(Trap::IllegalInstruction(pc));
                 };
                 self.write_rd(rd, val);
                 self.pc = pc.wrapping_add(4);
@@ -283,13 +272,51 @@ impl Cpu {
                         _ => Err(Trap::Unsupported("system")),
                     }
                 } else {
-                    // csrrw/csrrs/csrrc/csrrwi/csrrsi/csrrci — Zicsr.
-                    Err(Trap::Unsupported("Zicsr"))
+                    self.execute_csr(raw, rd, rs1, funct3, pc)
                 }
             }
 
             _ => Err(Trap::IllegalInstruction(pc)),
         }
+    }
+
+    /// Execute one of the six Zicsr read/modify/write instructions.
+    fn execute_csr(
+        &mut self,
+        raw: u32,
+        rd: u32,
+        rs1: u32,
+        funct3: u32,
+        pc: u32,
+    ) -> Result<StepOutcome, Trap> {
+        let address = raw >> 20;
+        let old = self.csr.read(address);
+        let source = if funct3 & 0b100 == 0 {
+            self.x(rs1)
+        } else {
+            rs1 // The rs1 field encodes the five-bit immediate (zimm).
+        };
+
+        let write = match funct3 {
+            0b001 | 0b101 => Some(source),                    // csrrw(i)
+            0b010 | 0b110 if rs1 != 0 => Some(old | source),  // csrrs(i)
+            0b011 | 0b111 if rs1 != 0 => Some(old & !source), // csrrc(i)
+            0b010 | 0b011 | 0b110 | 0b111 => None,
+            _ => return Err(Trap::IllegalInstruction(pc)),
+        };
+
+        // csr[11:10] = 0b11 denotes a read-only CSR. Pure reads through
+        // CSRRS/CSRRC with a zero source remain legal.
+        if let Some(value) = write {
+            if (address >> 10) & 0b11 == 0b11 {
+                return Err(Trap::IllegalInstruction(pc));
+            }
+            self.csr.write(address, value);
+        }
+
+        self.write_rd(rd, old);
+        self.pc = pc.wrapping_add(4);
+        Ok(StepOutcome::Continue)
     }
 }
 
