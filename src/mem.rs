@@ -2,9 +2,8 @@
 //!
 //! Implemented as a sparse map so any address may hold a byte without a fixed
 //! address-space limit. Reads of unwritten addresses return `0`. The model
-//! performs little-endian accesses and does **not** raise a trap on
-//! misaligned accesses — a deliberate simplification for a functional model
-//! (the hardware RTL is expected to trap; see `ROADMAP.md`, phase P2).
+//! performs little-endian accesses. The generic memory API permits unaligned
+//! accesses; the CPU enforces the ISA alignment rules before loads/stores.
 
 use std::collections::BTreeMap;
 

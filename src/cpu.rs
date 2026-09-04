@@ -2,10 +2,10 @@
 //!
 //! `Cpu` owns the program counter, the integer register file, and a CSR
 //! container. `step` fetches, decodes, and executes one instruction against
-//! a `Memory`. Extensions outside the implemented RV32IM base raise
+//! a `Memory`. Extensions outside the implemented RV32IMZicsr base raise
 //! [`Trap`] rather than fabricating a result.
 
-use crate::csr::Csr;
+use crate::csr::{addr as csr_addr, Csr};
 use crate::isa::{self, Decoded};
 use crate::mem::Memory;
 
@@ -37,6 +37,12 @@ pub enum Trap {
     /// The instruction at the given program counter is not a valid RV32IMZicsr
     /// instruction.
     IllegalInstruction(u32),
+    /// A fetch or taken control-flow target is not four-byte aligned.
+    InstructionAddressMisaligned(u32),
+    /// A load address does not meet the accessed value's alignment.
+    LoadAddressMisaligned(u32),
+    /// A store address does not meet the accessed value's alignment.
+    StoreAddressMisaligned(u32),
     /// A recognized-but-unimplemented extension (atomics, FP, etc.).
     Unsupported(&'static str),
 }
@@ -46,6 +52,8 @@ pub struct Cpu {
     pc: u32,
     x: [u32; 32],
     csr: Csr,
+    cycle: u64,
+    instret: u64,
 }
 
 impl Default for Cpu {
@@ -61,6 +69,8 @@ impl Cpu {
             pc: 0,
             x: [0; 32],
             csr: Csr::new(),
+            cycle: 0,
+            instret: 0,
         }
     }
 
@@ -82,6 +92,16 @@ impl Cpu {
     /// Read-only access to the CSR file.
     pub fn csr(&self) -> &Csr {
         &self.csr
+    }
+
+    /// Number of attempted instruction steps, including trapping steps.
+    pub fn cycle(&self) -> u64 {
+        self.cycle
+    }
+
+    /// Number of instructions that completed without trapping or stopping.
+    pub fn instret(&self) -> u64 {
+        self.instret
     }
 
     #[inline]
@@ -113,9 +133,17 @@ impl Cpu {
     /// Fetch, decode, and execute a single instruction.
     pub fn step(&mut self, mem: &mut Memory) -> Result<StepOutcome, Trap> {
         let pc = self.pc;
+        self.cycle = self.cycle.wrapping_add(1);
+        if pc & 0b11 != 0 {
+            return Err(Trap::InstructionAddressMisaligned(pc));
+        }
         let raw = mem.load_u32(pc);
         let inst = isa::decode(pc, raw);
-        self.execute(inst, mem)
+        let outcome = self.execute(inst, mem)?;
+        if outcome == StepOutcome::Continue {
+            self.instret = self.instret.wrapping_add(1);
+        }
+        Ok(outcome)
     }
 
     fn execute(&mut self, inst: Decoded, mem: &mut Memory) -> Result<StepOutcome, Trap> {
@@ -136,12 +164,12 @@ impl Cpu {
             isa::opcode::OP_IMM => {
                 let a = self.x(rs1);
                 let val = match funct3 {
-                    0b000 => a.wrapping_add(imm as u32),                     // addi
-                    0b001 => a.checked_shl((raw >> 20) & 0x1f).unwrap_or(0), // slli
-                    0b010 => ((a as i32) < imm) as u32,                      // slti
-                    0b011 => (a < imm as u32) as u32,                        // sltiu
-                    0b100 => a ^ imm as u32,                                 // xori
-                    0b101 => {
+                    0b000 => a.wrapping_add(imm as u32),               // addi
+                    0b001 if funct7 == 0 => a << ((raw >> 20) & 0x1f), // slli
+                    0b010 => ((a as i32) < imm) as u32,                // slti
+                    0b011 => (a < imm as u32) as u32,                  // sltiu
+                    0b100 => a ^ imm as u32,                           // xori
+                    0b101 if funct7 == 0 || funct7 == isa::ALT_FUNCT7 => {
                         let shamt = (raw >> 20) & 0x1f;
                         if funct7 == isa::ALT_FUNCT7 {
                             ((a as i32) >> shamt) as u32 // srai
@@ -187,10 +215,19 @@ impl Cpu {
                 let addr = self.x(rs1).wrapping_add(imm as u32);
                 let val = match funct3 {
                     isa::funct3::LB => (mem.read_bytes(addr, 1) as u8 as i8) as i32 as u32,
-                    isa::funct3::LH => (mem.read_bytes(addr, 2) as u16 as i16) as i32 as u32,
-                    isa::funct3::LW => mem.read_bytes(addr, 4) as u32,
+                    isa::funct3::LH => {
+                        require_alignment(addr, 2, Trap::LoadAddressMisaligned)?;
+                        (mem.read_bytes(addr, 2) as u16 as i16) as i32 as u32
+                    }
+                    isa::funct3::LW => {
+                        require_alignment(addr, 4, Trap::LoadAddressMisaligned)?;
+                        mem.read_bytes(addr, 4) as u32
+                    }
                     isa::funct3::LBU => mem.read_bytes(addr, 1) as u32,
-                    isa::funct3::LHU => mem.read_bytes(addr, 2) as u32,
+                    isa::funct3::LHU => {
+                        require_alignment(addr, 2, Trap::LoadAddressMisaligned)?;
+                        mem.read_bytes(addr, 2) as u32
+                    }
                     _ => return Err(Trap::IllegalInstruction(pc)),
                 };
                 self.write_rd(rd, val);
@@ -203,8 +240,14 @@ impl Cpu {
                 let val = self.x(rs2);
                 match funct3 {
                     isa::funct3::SB => mem.write_bytes(addr, 1, val as u64),
-                    isa::funct3::SH => mem.write_bytes(addr, 2, val as u64),
-                    isa::funct3::SW => mem.write_bytes(addr, 4, val as u64),
+                    isa::funct3::SH => {
+                        require_alignment(addr, 2, Trap::StoreAddressMisaligned)?;
+                        mem.write_bytes(addr, 2, val as u64);
+                    }
+                    isa::funct3::SW => {
+                        require_alignment(addr, 4, Trap::StoreAddressMisaligned)?;
+                        mem.write_bytes(addr, 4, val as u64);
+                    }
                     _ => return Err(Trap::IllegalInstruction(pc)),
                 }
                 self.pc = pc.wrapping_add(4);
@@ -224,7 +267,9 @@ impl Cpu {
                     _ => return Err(Trap::IllegalInstruction(pc)),
                 };
                 self.pc = if taken {
-                    pc.wrapping_add(imm as u32)
+                    let target = pc.wrapping_add(imm as u32);
+                    require_instruction_alignment(target)?;
+                    target
                 } else {
                     pc.wrapping_add(4)
                 };
@@ -232,13 +277,19 @@ impl Cpu {
             }
 
             isa::opcode::JAL => {
+                let target = pc.wrapping_add(imm as u32);
+                require_instruction_alignment(target)?;
                 self.write_rd(rd, pc.wrapping_add(4));
-                self.pc = pc.wrapping_add(imm as u32);
+                self.pc = target;
                 Ok(StepOutcome::Continue)
             }
 
             isa::opcode::JALR => {
+                if funct3 != 0 {
+                    return Err(Trap::IllegalInstruction(pc));
+                }
                 let target = self.x(rs1).wrapping_add(imm as u32) & !1;
+                require_instruction_alignment(target)?;
                 self.write_rd(rd, pc.wrapping_add(4));
                 self.pc = target;
                 Ok(StepOutcome::Continue)
@@ -259,13 +310,25 @@ impl Cpu {
             isa::opcode::MISC_MEM => {
                 // FENCE / FENCE.I: no memory-order or I-cache side effect for a
                 // single-hart integer functional model.
-                self.pc = pc.wrapping_add(4);
-                Ok(StepOutcome::Continue)
+                match funct3 {
+                    0b000 if valid_fence_encoding(raw) => {
+                        self.pc = pc.wrapping_add(4);
+                        Ok(StepOutcome::Continue)
+                    }
+                    0b001 if raw == 0x0000_100f => {
+                        self.pc = pc.wrapping_add(4);
+                        Ok(StepOutcome::Continue)
+                    }
+                    _ => Err(Trap::IllegalInstruction(pc)),
+                }
             }
 
             isa::opcode::SYSTEM => {
                 if funct3 == 0 {
-                    match imm as u32 {
+                    if rd != 0 || rs1 != 0 {
+                        return Err(Trap::IllegalInstruction(pc));
+                    }
+                    match raw >> 20 {
                         0x000 => Ok(StepOutcome::Ecall),
                         0x001 => Ok(StepOutcome::Ebreak),
                         // mret/sret/wfi and other system instructions.
@@ -290,7 +353,7 @@ impl Cpu {
         pc: u32,
     ) -> Result<StepOutcome, Trap> {
         let address = raw >> 20;
-        let old = self.csr.read(address);
+        let old = self.read_csr(address);
         let source = if funct3 & 0b100 == 0 {
             self.x(rs1)
         } else {
@@ -318,6 +381,38 @@ impl Cpu {
         self.pc = pc.wrapping_add(4);
         Ok(StepOutcome::Continue)
     }
+
+    fn read_csr(&self, address: u32) -> u32 {
+        match address {
+            csr_addr::CYCLE => self.cycle as u32,
+            csr_addr::CYCLEH => (self.cycle >> 32) as u32,
+            csr_addr::INSTRET => self.instret as u32,
+            csr_addr::INSTRETH => (self.instret >> 32) as u32,
+            _ => self.csr.read(address),
+        }
+    }
+}
+
+#[inline]
+fn require_alignment(addr: u32, alignment: u32, trap: fn(u32) -> Trap) -> Result<(), Trap> {
+    if addr & (alignment - 1) == 0 {
+        Ok(())
+    } else {
+        Err(trap(addr))
+    }
+}
+
+#[inline]
+fn require_instruction_alignment(addr: u32) -> Result<(), Trap> {
+    require_alignment(addr, 4, Trap::InstructionAddressMisaligned)
+}
+
+#[inline]
+fn valid_fence_encoding(raw: u32) -> bool {
+    let fm = (raw >> 28) & 0xf;
+    let predecessor = (raw >> 24) & 0xf;
+    let successor = (raw >> 20) & 0xf;
+    fm == 0 || (fm == 8 && predecessor == 0b0011 && successor == 0b0011)
 }
 
 /// Execute the M-extension multiply/divide instructions.

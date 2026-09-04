@@ -1,9 +1,8 @@
 //! Control and status register (CSR) container.
 //!
 //! CSR *addressing* is modeled here with the standard addresses and a sparse
-//! backing store, so the register file and trap plumbing can be wired before
-//! the `Zicsr` instructions themselves are implemented. Reading an unwritten
-//! CSR returns `0`.
+//! backing store. Reading an unwritten CSR returns `0`; dynamic counters are
+//! supplied by the CPU when a CSR instruction accesses them.
 
 use std::collections::BTreeMap;
 
@@ -28,6 +27,9 @@ pub mod addr {
     pub const CYCLE: u32 = 0xC00;
     pub const TIME: u32 = 0xC01;
     pub const INSTRET: u32 = 0xC02;
+    pub const CYCLEH: u32 = 0xC80;
+    pub const TIMEH: u32 = 0xC81;
+    pub const INSTRETH: u32 = 0xC82;
 }
 
 /// A sparse CSR register file.
