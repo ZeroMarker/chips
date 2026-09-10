@@ -14,28 +14,47 @@ milestones remain in [ROADMAP.md](ROADMAP.md).
 - [x] Reject reserved shift, `jalr`, fence, and system encodings.
 - [x] Expose working 64-bit `cycle` and `instret` counters through their RV32
       low/high CSR pairs.
+- [x] Route synchronous exceptions through machine trap entry using `mtvec`,
+      `mepc`, `mcause`, and `mtval`, including `ecall`/`ebreak` when a handler is
+      installed.
+- [x] Implement `mret` and the `mstatus` machine-mode fields this hart needs
+      (`MIE`, `MPIE`, `MPP`).
+- [x] Give `time`/`timeh` a time source that advances once per step.
+- [x] Implement CSR field semantics: WARL legalization for `mstatus`/`mtvec`/
+      `mepc`, constant `misa`/`mhartid`, M-mode-only `mie` masks, inert `mip`,
+      writable machine counters, and a trap for unimplemented CSR addresses.
+- [x] Convert instruction coverage to table-driven tests covering every RV32I,
+      RV32M, and Zicsr operation plus the architectural edge cases
+      (`tests/isa_coverage.rs`, `tests/traps.rs`).
+- [x] Improve the CLI with a configurable instruction limit, ABI register names,
+      counter output, and trap diagnostics.
 
 ## Next
 
-- [ ] Route synchronous exceptions through machine trap entry using `mepc`,
-      `mcause`, `mtval`, and `mtvec`.
-- [ ] Implement `mret` and the required `mstatus` machine-mode fields.
-- [ ] Define a time source for the `time`/`timeh` CSRs.
-- [ ] Convert instruction coverage to table-driven tests and cover every RV32I,
-      RV32M, and Zicsr operation plus architectural edge cases.
-- [ ] Add a runner for the official `riscv-tests` `rv32ui` and `rv32mi` suites.
-- [ ] Add CI for formatting, Clippy, unit tests, and ISA compliance tests.
+- [ ] Implement interrupt delivery: `mip`/`mie` currently cannot raise anything,
+      and there is no CLINT/PLIC or memory-mapped `mtime`.
+- [ ] Add the S/U privilege modes, which means `mstatus.MPP` stops being
+      hardwired to M, `sret`/`sfence.vma` become legal, and `ecall` reports its
+      originating mode.
+- [ ] Give the memory model a decoded address map and access faults
+      (`LoadAccessFault`/`StoreAccessFault`). It is currently a per-byte sparse
+      map where every address is backed: correct for arithmetic, but it cannot
+      model an unmapped region and will be slow for full-suite runs.
 - [ ] Add a stable per-instruction trace format containing PC, instruction,
       register/CSR changes, and memory writes for differential testing.
-- [ ] Improve the CLI with configurable instruction limits, ABI register names,
-      and optional trace output.
+- [ ] Add CI for formatting, Clippy, unit tests, and ISA compliance tests. Note
+      that `cargo`/`rustc` are not on the default `PATH` in this environment
+      (`~/.cargo/bin`), and no RISC-V cross toolchain, Spike, QEMU, Verilator, or
+      yosys is installed — ROADMAP phase P0's acceptance check is still blocked
+      on that tooling, not on code.
 - [ ] Add a README covering build, test, raw-binary generation, and CLI usage.
 
 ## Later
 
 - [ ] Implement the compressed `C` extension to reach the RV32IMC target.
+  `Trap::Unsupported("C")` already reports the encoding when one appears.
 - [ ] Build the first single-cycle RTL core and compare it against this model.
 - [ ] Add constrained-random instruction generation and Spike differential
       testing.
 - [ ] Add bus, boot ROM, RAM, UART, and interrupt-controller models for SoC
-      integration.
+      integration, replacing the model time base with CLINT `mtime`.

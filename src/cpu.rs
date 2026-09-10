@@ -1,11 +1,30 @@
 //! CPU state and the RV32IMZicsr execute loop.
 //!
-//! `Cpu` owns the program counter, the integer register file, and a CSR
-//! container. `step` fetches, decodes, and executes one instruction against
-//! a `Memory`. Extensions outside the implemented RV32IMZicsr base raise
-//! [`Trap`] rather than fabricating a result.
+//! `Cpu` owns the program counter, the integer register file, a CSR container,
+//! the cycle/retired-instruction counters, and a model time base. `step`
+//! fetches, decodes, and executes one instruction against a `Memory`.
+//!
+//! # Trap handling
+//!
+//! A synchronous exception or an `ecall`/`ebreak` enters the machine-mode
+//! handler described by `mtvec`: `mepc`, `mcause` and `mtval` are written, the
+//! interrupt-enable stack is pushed in `mstatus` (`MIE` into `MPIE`, `MIE`
+//! cleared, `MPP` = M), and the PC is set to the `mtvec` base. `mret` unwinds
+//! that state: `MIE` is restored from `MPIE`, `MPIE` is set, and the PC returns
+//! to `mepc`. Synchronous exceptions always enter at the `mtvec` base, even
+//! when `mtvec` selects vectored mode, because only interrupts are vectored.
+//!
+//! A handler counts as installed when `mtvec` is non-zero. With no handler the
+//! model has no architecturally meaningful target to jump to, so exceptions are
+//! reported to the caller as a [`Trap`] and `ecall`/`ebreak` end the
+//! [`Cpu::run`] loop — which is what lets a bare-metal image halt itself.
+//!
+//! Only machine mode exists, so `mstatus.MPP` is hardwired to M and `mret`
+//! always returns to machine mode. Interrupts are not delivered: `mip` reads
+//! zero and `mie` only stores the M-mode enable bits. `wfi` retires
+//! immediately because there is no interrupt source to wait for.
 
-use crate::csr::{addr as csr_addr, Csr};
+use crate::csr::{addr as csr_addr, Csr, MSTATUS_MIE, MSTATUS_MPIE};
 use crate::isa::{self, Decoded};
 use crate::mem::Memory;
 
@@ -14,9 +33,14 @@ use crate::mem::Memory;
 pub enum StepOutcome {
     /// Instruction retired normally; PC already advanced.
     Continue,
-    /// `ecall` was executed — the program requested an environment call.
+    /// A trap was taken: the PC is now at the `mtvec` handler and the trap CSRs
+    /// describe the cause.
+    TrapTaken,
+    /// `ecall` was executed with no handler installed — the program requested
+    /// an environment call.
     Ecall,
-    /// `ebreak` was executed — the program halted (debug breakpoint).
+    /// `ebreak` was executed with no handler installed — the program halted
+    /// (debug breakpoint).
     Ebreak,
 }
 
@@ -31,20 +55,62 @@ pub enum StopReason {
     Limit,
 }
 
-/// A trap raised while executing an instruction.
+/// A synchronous exception raised while executing an instruction.
+///
+/// The payload is the architectural `mtval` value plus what [`Trap::mtval`]
+/// cannot express: for [`Trap::IllegalInstruction`] it is the faulting encoding
+/// and for the breakpoint/ecall variants the faulting PC. The faulting PC of
+/// any trap is available as `mtval` (`mepc` once routed) and as `Cpu::pc()`
+/// before the handler runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Trap {
-    /// The instruction at the given program counter is not a valid RV32IMZicsr
-    /// instruction.
-    IllegalInstruction(u32),
     /// A fetch or taken control-flow target is not four-byte aligned.
     InstructionAddressMisaligned(u32),
+    /// The encoding at the current PC is not a valid RV32IMZicsr instruction,
+    /// or it names a CSR this model does not implement. Payload: the encoding.
+    IllegalInstruction(u32),
+    /// `ebreak` was executed and a trap handler is installed. Payload: the PC of
+    /// the `ebreak`.
+    Breakpoint(u32),
     /// A load address does not meet the accessed value's alignment.
     LoadAddressMisaligned(u32),
     /// A store address does not meet the accessed value's alignment.
     StoreAddressMisaligned(u32),
-    /// A recognized-but-unimplemented extension (atomics, FP, etc.).
+    /// `ecall` was executed and a trap handler is installed. Payload: the PC of
+    /// the `ecall`.
+    EnvironmentCallFromM(u32),
+    /// A recognized encoding of an extension this model does not implement.
+    /// Architecturally identical to an illegal instruction (`mcause` 2), kept
+    /// separate so a driver can report *which* extension is missing.
     Unsupported(&'static str),
+}
+
+impl Trap {
+    /// The `mcause` value written when this trap enters the machine-mode handler.
+    pub fn mcause(&self) -> u32 {
+        match self {
+            Trap::InstructionAddressMisaligned(_) => 0,
+            Trap::IllegalInstruction(_) | Trap::Unsupported(_) => 2,
+            Trap::Breakpoint(_) => 3,
+            Trap::LoadAddressMisaligned(_) => 4,
+            Trap::StoreAddressMisaligned(_) => 6,
+            Trap::EnvironmentCallFromM(_) => 11,
+        }
+    }
+
+    /// The `mtval` value written when this trap enters the machine-mode handler.
+    pub fn mtval(&self) -> u32 {
+        match self {
+            Trap::InstructionAddressMisaligned(val)
+            | Trap::LoadAddressMisaligned(val)
+            | Trap::StoreAddressMisaligned(val)
+            | Trap::Breakpoint(val) => *val,
+            Trap::IllegalInstruction(encoding) => *encoding,
+            // ECALL carries no address, and an unimplemented extension has no
+            // encoding-specific value to report.
+            Trap::EnvironmentCallFromM(_) | Trap::Unsupported(_) => 0,
+        }
+    }
 }
 
 /// A RISC-V CPU with RV32IM integer execution.
@@ -54,6 +120,7 @@ pub struct Cpu {
     csr: Csr,
     cycle: u64,
     instret: u64,
+    mtime: u64,
 }
 
 impl Default for Cpu {
@@ -63,7 +130,8 @@ impl Default for Cpu {
 }
 
 impl Cpu {
-    /// Create a fresh CPU: PC = 0, all registers zero, empty CSR file.
+    /// Create a fresh CPU: PC = 0, all registers zero, empty CSR file, no trap
+    /// handler installed (`mtvec` = 0) and no interrupts enabled.
     pub fn new() -> Self {
         Cpu {
             pc: 0,
@@ -71,6 +139,7 @@ impl Cpu {
             csr: Csr::new(),
             cycle: 0,
             instret: 0,
+            mtime: 0,
         }
     }
 
@@ -104,6 +173,26 @@ impl Cpu {
         self.instret
     }
 
+    /// Value returned by the `time`/`timeh` CSRs.
+    ///
+    /// The model advances it once per step. A real hart reads this from the
+    /// memory-mapped `mtime` register of the interrupt controller, which arrives
+    /// with the SoC phase; until then this is the time base.
+    pub fn mtime(&self) -> u64 {
+        self.mtime
+    }
+
+    /// Set the model time base, e.g. from a future CLINT implementation.
+    pub fn set_mtime(&mut self, mtime: u64) {
+        self.mtime = mtime;
+    }
+
+    /// Is a trap handler installed? The model treats a non-zero `mtvec` as the
+    /// presence of one.
+    pub fn handler_installed(&self) -> bool {
+        self.csr.read(csr_addr::MTVEC) != 0
+    }
+
     #[inline]
     fn x(&self, rs: u32) -> u32 {
         self.x[(rs as usize) & (isa::NUM_REGS - 1)]
@@ -118,11 +207,11 @@ impl Cpu {
     }
 
     /// Execute instructions until an `ecall`/`ebreak` or the instruction
-    /// budget is exhausted.
+    /// budget is exhausted. Taken traps do not stop the loop.
     pub fn run(&mut self, mem: &mut Memory, budget: u64) -> Result<StopReason, Trap> {
         for _ in 0..budget {
             match self.step(mem)? {
-                StepOutcome::Continue => {}
+                StepOutcome::Continue | StepOutcome::TrapTaken => {}
                 StepOutcome::Ecall => return Ok(StopReason::Ecall),
                 StepOutcome::Ebreak => return Ok(StopReason::Ebreak),
             }
@@ -134,16 +223,53 @@ impl Cpu {
     pub fn step(&mut self, mem: &mut Memory) -> Result<StepOutcome, Trap> {
         let pc = self.pc;
         self.cycle = self.cycle.wrapping_add(1);
+        self.mtime = self.mtime.wrapping_add(1);
+
         if pc & 0b11 != 0 {
-            return Err(Trap::InstructionAddressMisaligned(pc));
+            return self.handle_trap(Trap::InstructionAddressMisaligned(pc));
         }
+
         let raw = mem.load_u32(pc);
-        let inst = isa::decode(pc, raw);
-        let outcome = self.execute(inst, mem)?;
+        let inst = isa::decode(raw);
+        let outcome = match self.execute(inst, mem) {
+            Ok(outcome) => outcome,
+            Err(trap) => return self.handle_trap(trap),
+        };
         if outcome == StepOutcome::Continue {
             self.instret = self.instret.wrapping_add(1);
         }
         Ok(outcome)
+    }
+
+    /// Deliver a trap, or report it when there is nowhere to deliver it.
+    fn handle_trap(&mut self, trap: Trap) -> Result<StepOutcome, Trap> {
+        if !self.handler_installed() {
+            // No handler: `ecall`/`ebreak` end the run loop so a bare-metal
+            // image can halt itself, and every other exception is the caller's
+            // problem.
+            return match trap {
+                Trap::EnvironmentCallFromM(_) => Ok(StepOutcome::Ecall),
+                Trap::Breakpoint(_) => Ok(StepOutcome::Ebreak),
+                other => Err(other),
+            };
+        }
+
+        let mtvec = self.csr.read(csr_addr::MTVEC);
+        self.csr.write(csr_addr::MEPC, self.pc);
+        self.csr.write(csr_addr::MCAUSE, trap.mcause());
+        self.csr.write(csr_addr::MTVAL, trap.mtval());
+
+        // Entering M-mode: MPIE <- MIE, MIE <- 0. MPP is hardwired to M.
+        let mstatus = self.csr.read(csr_addr::MSTATUS);
+        let mut next = mstatus & !(MSTATUS_MIE | MSTATUS_MPIE);
+        if mstatus & MSTATUS_MIE != 0 {
+            next |= MSTATUS_MPIE;
+        }
+        self.csr.write(csr_addr::MSTATUS, next);
+
+        // A synchronous exception enters at BASE even in vectored mode.
+        self.pc = mtvec & !0b11;
+        Ok(StepOutcome::TrapTaken)
     }
 
     fn execute(&mut self, inst: Decoded, mem: &mut Memory) -> Result<StepOutcome, Trap> {
@@ -156,8 +282,8 @@ impl Cpu {
             rs2,
             funct3,
             funct7,
+            funct12: _,
             imm,
-            pc: _,
         } = inst;
 
         match opcode {
@@ -179,7 +305,7 @@ impl Cpu {
                     }
                     0b110 => a | imm as u32, // ori
                     0b111 => a & imm as u32, // andi
-                    _ => return Err(Trap::IllegalInstruction(pc)),
+                    _ => return Err(Trap::IllegalInstruction(raw)),
                 };
                 self.write_rd(rd, val);
                 self.pc = pc.wrapping_add(4);
@@ -203,7 +329,7 @@ impl Cpu {
                         (isa::ALT_FUNCT7, 0b101) => ((a as i32) >> (b & 0x1f)) as u32,
                         (0, 0b110) => a | b,
                         (0, 0b111) => a & b,
-                        _ => return Err(Trap::IllegalInstruction(pc)),
+                        _ => return Err(Trap::IllegalInstruction(raw)),
                     }
                 };
                 self.write_rd(rd, val);
@@ -228,7 +354,7 @@ impl Cpu {
                         require_alignment(addr, 2, Trap::LoadAddressMisaligned)?;
                         mem.read_bytes(addr, 2) as u32
                     }
-                    _ => return Err(Trap::IllegalInstruction(pc)),
+                    _ => return Err(Trap::IllegalInstruction(raw)),
                 };
                 self.write_rd(rd, val);
                 self.pc = pc.wrapping_add(4);
@@ -248,7 +374,7 @@ impl Cpu {
                         require_alignment(addr, 4, Trap::StoreAddressMisaligned)?;
                         mem.write_bytes(addr, 4, val as u64);
                     }
-                    _ => return Err(Trap::IllegalInstruction(pc)),
+                    _ => return Err(Trap::IllegalInstruction(raw)),
                 }
                 self.pc = pc.wrapping_add(4);
                 Ok(StepOutcome::Continue)
@@ -264,7 +390,7 @@ impl Cpu {
                     isa::funct3::BGE => (a as i32) >= (b as i32),
                     isa::funct3::BLTU => a < b,
                     isa::funct3::BGEU => a >= b,
-                    _ => return Err(Trap::IllegalInstruction(pc)),
+                    _ => return Err(Trap::IllegalInstruction(raw)),
                 };
                 self.pc = if taken {
                     let target = pc.wrapping_add(imm as u32);
@@ -286,7 +412,7 @@ impl Cpu {
 
             isa::opcode::JALR => {
                 if funct3 != 0 {
-                    return Err(Trap::IllegalInstruction(pc));
+                    return Err(Trap::IllegalInstruction(raw));
                 }
                 let target = self.x(rs1).wrapping_add(imm as u32) & !1;
                 require_instruction_alignment(target)?;
@@ -319,76 +445,139 @@ impl Cpu {
                         self.pc = pc.wrapping_add(4);
                         Ok(StepOutcome::Continue)
                     }
-                    _ => Err(Trap::IllegalInstruction(pc)),
+                    _ => Err(Trap::IllegalInstruction(raw)),
                 }
             }
 
             isa::opcode::SYSTEM => {
                 if funct3 == 0 {
-                    if rd != 0 || rs1 != 0 {
-                        return Err(Trap::IllegalInstruction(pc));
-                    }
-                    match raw >> 20 {
-                        0x000 => Ok(StepOutcome::Ecall),
-                        0x001 => Ok(StepOutcome::Ebreak),
-                        // mret/sret/wfi and other system instructions.
-                        _ => Err(Trap::Unsupported("system")),
-                    }
+                    self.execute_system(&inst, pc)
                 } else {
-                    self.execute_csr(raw, rd, rs1, funct3, pc)
+                    self.execute_csr(&inst, pc)
                 }
             }
 
-            _ => Err(Trap::IllegalInstruction(pc)),
+            // Recognized encodings of extensions this model does not implement.
+            // Architecturally these are illegal instructions (mcause 2); naming
+            // the extension makes a failing run diagnosable.
+            isa::opcode::LOAD_FP | isa::opcode::STORE_FP => Err(Trap::Unsupported("F/D")),
+            isa::opcode::AMO => Err(Trap::Unsupported("A")),
+            isa::opcode::OP_FP => Err(Trap::Unsupported("F/D")),
+            isa::opcode::OP_V => Err(Trap::Unsupported("V")),
+            // A 16-bit compressed instruction: its low two bits are never 0b11,
+            // so it can only appear under one of these three opcodes.
+            0b000..=0b010 => Err(Trap::Unsupported("C")),
+
+            _ => Err(Trap::IllegalInstruction(raw)),
         }
     }
 
-    /// Execute one of the six Zicsr read/modify/write instructions.
-    fn execute_csr(
-        &mut self,
-        raw: u32,
-        rd: u32,
-        rs1: u32,
-        funct3: u32,
-        pc: u32,
-    ) -> Result<StepOutcome, Trap> {
-        let address = raw >> 20;
-        let old = self.read_csr(address);
-        let source = if funct3 & 0b100 == 0 {
-            self.x(rs1)
-        } else {
-            rs1 // The rs1 field encodes the five-bit immediate (zimm).
-        };
+    /// Execute a `funct3 = 0` SYSTEM instruction: `ecall`, `ebreak`, `mret`,
+    /// `wfi`, or an illegal encoding such as `sret`/`sfence.vma`.
+    fn execute_system(&mut self, inst: &Decoded, pc: u32) -> Result<StepOutcome, Trap> {
+        // Everything this model implements requires rd = rs1 = 0; other values
+        // in those fields are reserved encodings.
+        let no_operands = inst.rd == 0 && inst.rs1 == 0;
 
-        let write = match funct3 {
-            0b001 | 0b101 => Some(source),                    // csrrw(i)
-            0b010 | 0b110 if rs1 != 0 => Some(old | source),  // csrrs(i)
-            0b011 | 0b111 if rs1 != 0 => Some(old & !source), // csrrc(i)
-            0b010 | 0b011 | 0b110 | 0b111 => None,
-            _ => return Err(Trap::IllegalInstruction(pc)),
-        };
-
-        // csr[11:10] = 0b11 denotes a read-only CSR. Pure reads through
-        // CSRRS/CSRRC with a zero source remain legal.
-        if let Some(value) = write {
-            if (address >> 10) & 0b11 == 0b11 {
-                return Err(Trap::IllegalInstruction(pc));
+        match inst.funct12 {
+            isa::system::ECALL if no_operands => Err(Trap::EnvironmentCallFromM(pc)),
+            isa::system::EBREAK if no_operands => Err(Trap::Breakpoint(pc)),
+            isa::system::MRET if no_operands => self.execute_mret(),
+            // WFI is legal in machine mode. With no interrupt controller to wait
+            // for, the model retires it immediately.
+            isa::system::WFI if no_operands => {
+                self.pc = pc.wrapping_add(4);
+                Ok(StepOutcome::Continue)
             }
-            self.csr.write(address, value);
+            // SRET (0x102) and SFENCE.VMA (0x120…) need S-mode and virtual
+            // memory, and every other encoding here is reserved.
+            _ => Err(Trap::IllegalInstruction(inst.raw)),
+        }
+    }
+
+    /// `mret`: restore the interrupt-enable stack and return to `mepc`.
+    fn execute_mret(&mut self) -> Result<StepOutcome, Trap> {
+        let mstatus = self.csr.read(csr_addr::MSTATUS);
+        let mut next = mstatus & !(MSTATUS_MIE | MSTATUS_MPIE);
+        if mstatus & MSTATUS_MPIE != 0 {
+            next |= MSTATUS_MIE; // MIE <- MPIE
+        }
+        next |= MSTATUS_MPIE; // MPIE <- 1
+                              // MPP is hardwired to M, so `mret` always returns to machine mode.
+        self.csr.write(csr_addr::MSTATUS, next);
+
+        self.pc = self.csr.read(csr_addr::MEPC);
+        Ok(StepOutcome::Continue)
+    }
+
+    /// Execute one of the six Zicsr read/modify/write instructions.
+    fn execute_csr(&mut self, inst: &Decoded, pc: u32) -> Result<StepOutcome, Trap> {
+        let address = inst.funct12;
+        if !Csr::exists(address) {
+            return Err(Trap::IllegalInstruction(inst.raw));
         }
 
-        self.write_rd(rd, old);
+        let immediate = inst.funct3 & 0b100 != 0;
+        let source = if immediate {
+            inst.rs1 // The rs1 field encodes the five-bit immediate (zimm).
+        } else {
+            self.x(inst.rs1)
+        };
+
+        // CSRRW/CSRRWI with rd = x0 must not read the CSR: a read may have side
+        // effects, and the architecture forbids them here. Everything else needs
+        // the old value.
+        let reads = !(inst.funct3 & 0b011 == 0b001 && inst.rd == 0);
+        let old = if reads { self.read_csr(address) } else { 0 };
+
+        // A write happens for CSRRW/CSRRWI always, and for CSRRS/CSRRC only when
+        // the source field is non-zero (a pure read).
+        let write = match inst.funct3 & 0b011 {
+            0b001 => Some(source),                         // csrrw(i)
+            0b010 if inst.rs1 != 0 => Some(old | source),  // csrrs(i)
+            0b011 if inst.rs1 != 0 => Some(old & !source), // csrrc(i)
+            0b010 | 0b011 => None,                         // rs1 = x0: read only, never a write
+            _ => return Err(Trap::IllegalInstruction(inst.raw)),
+        };
+
+        if let Some(value) = write {
+            // csr[11:10] = 0b11 denotes a read-only CSR; writing one is illegal.
+            if Csr::is_read_only(address) {
+                return Err(Trap::IllegalInstruction(inst.raw));
+            }
+            self.write_csr(address, value);
+        }
+
+        self.write_rd(inst.rd, old);
         self.pc = pc.wrapping_add(4);
         Ok(StepOutcome::Continue)
     }
 
+    /// Read a CSR, servicing the counter and time registers from CPU state.
     fn read_csr(&self, address: u32) -> u32 {
         match address {
-            csr_addr::CYCLE => self.cycle as u32,
-            csr_addr::CYCLEH => (self.cycle >> 32) as u32,
-            csr_addr::INSTRET => self.instret as u32,
-            csr_addr::INSTRETH => (self.instret >> 32) as u32,
+            csr_addr::MCYCLE | csr_addr::CYCLE => self.cycle as u32,
+            csr_addr::MCYCLEH | csr_addr::CYCLEH => (self.cycle >> 32) as u32,
+            csr_addr::MINSTRET | csr_addr::INSTRET => self.instret as u32,
+            csr_addr::MINSTRETH | csr_addr::INSTRETH => (self.instret >> 32) as u32,
+            csr_addr::TIME => self.mtime as u32,
+            csr_addr::TIMEH => (self.mtime >> 32) as u32,
             _ => self.csr.read(address),
+        }
+    }
+
+    /// Write a CSR, servicing the writable machine counters from CPU state.
+    /// The read-only unprivileged aliases never reach here: `execute_csr`
+    /// rejects them first.
+    fn write_csr(&mut self, address: u32, value: u32) {
+        match address {
+            csr_addr::MCYCLE => self.cycle = (self.cycle & !0xFFFF_FFFF) | value as u64,
+            csr_addr::MCYCLEH => self.cycle = (self.cycle & 0xFFFF_FFFF) | ((value as u64) << 32),
+            csr_addr::MINSTRET => self.instret = (self.instret & !0xFFFF_FFFF) | value as u64,
+            csr_addr::MINSTRETH => {
+                self.instret = (self.instret & 0xFFFF_FFFF) | ((value as u64) << 32)
+            }
+            _ => self.csr.write(address, value),
         }
     }
 }

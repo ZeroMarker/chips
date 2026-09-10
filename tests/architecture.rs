@@ -112,8 +112,8 @@ fn reserved_encodings_are_illegal() {
         let (mut cpu, mut mem) = cpu_with_instruction(base, instruction);
         assert_eq!(
             cpu.step(&mut mem),
-            Err(Trap::IllegalInstruction(base)),
-            "encoding 0x{instruction:08x} must trap"
+            Err(Trap::IllegalInstruction(instruction)),
+            "encoding 0x{instruction:08x} must trap with its own encoding as mtval"
         );
     }
 }

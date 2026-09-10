@@ -25,16 +25,32 @@ pub fn reg_name(i: u32) -> &'static str {
 /// 7-bit major opcodes.
 pub mod opcode {
     pub const LOAD: u32 = 0x03;
+    pub const LOAD_FP: u32 = 0x07;
+    pub const MISC_MEM: u32 = 0x0F;
     pub const OP_IMM: u32 = 0x13;
     pub const AUIPC: u32 = 0x17;
     pub const STORE: u32 = 0x23;
+    pub const STORE_FP: u32 = 0x27;
+    pub const AMO: u32 = 0x2F;
     pub const OP: u32 = 0x33;
     pub const LUI: u32 = 0x37;
+    pub const OP_FP: u32 = 0x53;
+    pub const OP_V: u32 = 0x57;
     pub const BRANCH: u32 = 0x63;
     pub const JALR: u32 = 0x67;
     pub const JAL: u32 = 0x6F;
-    pub const MISC_MEM: u32 = 0x0F;
     pub const SYSTEM: u32 = 0x73;
+}
+
+/// `funct12` (`inst[31:20]`) values identifying the operand-less privileged
+/// SYSTEM instructions. Every other `funct3 = 0` SYSTEM encoding is illegal in
+/// this machine-mode-only RV32IMZicsr model.
+pub mod system {
+    pub const ECALL: u32 = 0x000;
+    pub const EBREAK: u32 = 0x001;
+    pub const SRET: u32 = 0x102;
+    pub const WFI: u32 = 0x105;
+    pub const MRET: u32 = 0x302;
 }
 
 /// `funct3` values for load/store, branch and OP/OP-IMM groups.
@@ -68,7 +84,6 @@ pub const M_FUNCT7: u32 = 0x01;
 /// A decoded 32-bit instruction.
 #[derive(Debug, Clone, Copy)]
 pub struct Decoded {
-    pub pc: u32,
     pub raw: u32,
     pub opcode: u32,
     pub rd: u32,
@@ -76,6 +91,9 @@ pub struct Decoded {
     pub rs2: u32,
     pub funct3: u32,
     pub funct7: u32,
+    /// `inst[31:20]`: the CSR address for Zicsr instructions, the operand-less
+    /// SYSTEM selector (`ecall`, `mret`, …), or the shift amount for OP-IMM.
+    pub funct12: u32,
     /// Sign-extended immediate, decoded per the instruction's format.
     pub imm: i32,
 }
@@ -139,9 +157,8 @@ fn immediate(inst: u32) -> i32 {
 }
 
 /// Decode a 32-bit little-endian instruction word.
-pub fn decode(pc: u32, raw: u32) -> Decoded {
+pub fn decode(raw: u32) -> Decoded {
     Decoded {
-        pc,
         raw,
         opcode: raw & 0x7f,
         rd: (raw >> 7) & 0x1f,
@@ -149,6 +166,7 @@ pub fn decode(pc: u32, raw: u32) -> Decoded {
         rs1: (raw >> 15) & 0x1f,
         rs2: (raw >> 20) & 0x1f,
         funct7: (raw >> 25) & 0x7f,
+        funct12: raw >> 20,
         imm: immediate(raw),
     }
 }

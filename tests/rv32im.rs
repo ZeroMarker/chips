@@ -226,6 +226,9 @@ fn zicsr_rejects_writes_to_read_only_csrs() {
     cpu.set_pc(base);
 
     assert_eq!(cpu.step(&mut mem), Ok(chips::cpu::StepOutcome::Continue));
-    assert_eq!(cpu.step(&mut mem), Err(Trap::IllegalInstruction(base + 4)));
+    assert_eq!(
+        cpu.step(&mut mem),
+        Err(Trap::IllegalInstruction(0xC000_1073))
+    );
     assert_eq!(cpu.pc(), base + 4, "a trapped instruction must not retire");
 }
