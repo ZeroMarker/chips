@@ -28,9 +28,17 @@ milestones remain in [ROADMAP.md](ROADMAP.md).
       (`tests/isa_coverage.rs`, `tests/traps.rs`).
 - [x] Improve the CLI with a configurable instruction limit, ABI register names,
       counter output, and trap diagnostics.
+- [x] Add CI (`.github/workflows/ci.yml`): formatting, Clippy with warnings
+      denied, rustdoc, tests on Linux/macOS/Windows in both profiles, and a
+      `riscv-smoke` job that assembles `scripts/smoke.S` with the real RISC-V
+      cross toolchain and runs the image on the model.
 
 ## Next
 
+- [ ] Extend the toolchain smoke test into a real `riscv-tests` `rv32ui`/`rv32mi`
+      runner (`tohost`/`ecall` pass-fail convention). CI assembles and runs one
+      program today; the official suites need a runner and a target platform
+      definition, and Spike is still absent as an external reference.
 - [ ] Implement interrupt delivery: `mip`/`mie` currently cannot raise anything,
       and there is no CLINT/PLIC or memory-mapped `mtime`.
 - [ ] Add the S/U privilege modes, which means `mstatus.MPP` stops being
@@ -42,12 +50,12 @@ milestones remain in [ROADMAP.md](ROADMAP.md).
       model an unmapped region and will be slow for full-suite runs.
 - [ ] Add a stable per-instruction trace format containing PC, instruction,
       register/CSR changes, and memory writes for differential testing.
-- [ ] Add CI for formatting, Clippy, unit tests, and ISA compliance tests. Note
-      that `cargo`/`rustc` are not on the default `PATH` in this environment
-      (`~/.cargo/bin`), and no RISC-V cross toolchain, Spike, QEMU, Verilator, or
-      yosys is installed — ROADMAP phase P0's acceptance check is still blocked
-      on that tooling, not on code.
-- [ ] Add a README covering build, test, raw-binary generation, and CLI usage.
+- [ ] Add a README covering build, test, raw-binary generation, CLI usage, and
+      what CI does and does not cover. Note that `cargo`/`rustc` are not on the
+      default `PATH` in this development environment (`~/.cargo/bin`), and that no
+      RISC-V cross toolchain, Spike, QEMU, Verilator, or yosys is installed here —
+      `scripts/riscv-smoke.sh` skips itself locally and `--require` makes it fail,
+      which is what CI uses.
 
 ## Later
 

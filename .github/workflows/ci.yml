@@ -1,0 +1,103 @@
+name: CI
+
+# Gates every change with formatting, lints, tests, and — most importantly — a
+# real cross-toolchain run of the model. `riscv-smoke` is the end-to-end check
+# that the Clippy-and-unit-tests jobs cannot give: compiler-produced RV32IM
+# encodings executed by the golden model.
+#
+# What CI still cannot check is the ROADMAP P0 acceptance criterion proper
+# (running `riscv-tests` against the model *and* a hardware RTL peer, with Spike
+# as an external reference). No Spike, QEMU, Verilator, or RTL exists yet; see
+# TODO.md.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# Superseded runs on the same ref are wasted minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# The jobs only read the repository.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # A warning anywhere is a failure, including the `unsafe_code = "forbid"`
+  # invariant declared in Cargo.toml.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    name: Format, lints, docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One broken platform should not hide the others.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The model is portable safe `std` Rust, so the same assertions must hold
+      # on every platform — including the driver tests in tests/cli.rs, which
+      # write an image to a temporary file and execute the real binary.
+      - name: Test (debug, overflow checks on)
+        run: cargo test --all-targets
+
+      # Arithmetically the model relies on wrapping operations, so the release
+      # profile (overflow checks off) must produce identical results.
+      - name: Test (release)
+        run: cargo test --release --all-targets
+
+  riscv-smoke:
+    name: RISC-V toolchain smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Provides riscv64-unknown-elf-gcc and -objcopy. The toolchain is named
+      # riscv64-* even though the smoke program targets rv32im.
+      - name: Install the RISC-V cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends gcc-riscv64-unknown-elf
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # --require turns a missing toolchain into a failure: this job exists to
+      # run the real thing, so silently skipping would defeat it. Invoked through
+      # bash so a checkout without the executable bit still works.
+      - name: Assemble scripts/smoke.S and run it on the model
+        run: bash scripts/riscv-smoke.sh --require

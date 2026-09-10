@@ -6,3 +6,11 @@ description = "RV32IMZicsr functional model — software golden reference for th
 license = "MIT"
 
 [dependencies]
+
+# The model is the golden reference for the hardware, so the one invariant worth
+# enforcing in the manifest is that it is entirely safe Rust: every memory access
+# goes through the modelled address space, and a reviewer (or a hardware
+# engineer) never has to reason about undefined behaviour. CI denies warnings, so
+# this is a build failure rather than a convention.
+[lints.rust]
+unsafe_code = "forbid"
