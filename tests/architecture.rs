@@ -4,8 +4,8 @@ use chips::cpu::{Cpu, StepOutcome, Trap};
 use chips::Memory;
 
 fn cpu_with_instruction(base: u32, instruction: u32) -> (Cpu, Memory) {
-    let mut mem = Memory::new();
-    mem.store_u32(base, instruction);
+    let mut mem = Memory::permissive();
+    mem.poke_u32(base, instruction);
     let mut cpu = Cpu::new();
     cpu.set_pc(base);
     (cpu, mem)
@@ -14,7 +14,7 @@ fn cpu_with_instruction(base: u32, instruction: u32) -> (Cpu, Memory) {
 #[test]
 fn instruction_fetch_requires_four_byte_alignment() {
     let mut cpu = Cpu::new();
-    let mut mem = Memory::new();
+    let mut mem = Memory::permissive();
     cpu.set_pc(0x1002);
 
     assert_eq!(
@@ -56,7 +56,7 @@ fn loads_and_stores_enforce_natural_alignment() {
     let base = 0x3000;
 
     let (mut load_cpu, mut load_mem) = cpu_with_instruction(base, 0x0010_0093); // addi x1, x0, 1
-    load_mem.store_u32(base + 4, 0x0000_a103); // lw x2, 0(x1)
+    load_mem.poke_u32(base + 4, 0x0000_a103); // lw x2, 0(x1)
     assert_eq!(load_cpu.step(&mut load_mem), Ok(StepOutcome::Continue));
     assert_eq!(
         load_cpu.step(&mut load_mem),
@@ -65,25 +65,25 @@ fn loads_and_stores_enforce_natural_alignment() {
     assert_eq!(load_cpu.reg(2), 0);
 
     let (mut store_cpu, mut store_mem) = cpu_with_instruction(base, 0x0010_0093); // addi x1, x0, 1
-    store_mem.store_u32(base + 4, 0x0020_9023); // sh x2, 0(x1)
-    store_mem.write_u8(1, 0xaa);
-    store_mem.write_u8(2, 0xbb);
+    store_mem.poke_u32(base + 4, 0x0020_9023); // sh x2, 0(x1)
+    store_mem.poke_u8(1, 0xaa);
+    store_mem.poke_u8(2, 0xbb);
     assert_eq!(store_cpu.step(&mut store_mem), Ok(StepOutcome::Continue));
     assert_eq!(
         store_cpu.step(&mut store_mem),
         Err(Trap::StoreAddressMisaligned(1))
     );
-    assert_eq!(store_mem.read_u8(1), 0xaa, "a trapping store has no effect");
-    assert_eq!(store_mem.read_u8(2), 0xbb, "a trapping store has no effect");
+    assert_eq!(store_mem.peek_u8(1), 0xaa, "a trapping store has no effect");
+    assert_eq!(store_mem.peek_u8(2), 0xbb, "a trapping store has no effect");
 }
 
 #[test]
 fn cycle_and_instret_counters_track_execution() {
     let base = 0x4000;
-    let mut mem = Memory::new();
-    mem.store_u32(base, 0xC000_22F3); // csrrs x5, cycle, x0
-    mem.store_u32(base + 4, 0xC020_2373); // csrrs x6, instret, x0
-    mem.store_u32(base + 8, 0x0010_0073); // ebreak
+    let mut mem = Memory::permissive();
+    mem.poke_u32(base, 0xC000_22F3); // csrrs x5, cycle, x0
+    mem.poke_u32(base + 4, 0xC020_2373); // csrrs x6, instret, x0
+    mem.poke_u32(base + 8, 0x0010_0073); // ebreak
     let mut cpu = Cpu::new();
     cpu.set_pc(base);
 

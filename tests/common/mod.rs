@@ -162,13 +162,13 @@ pub const fn fence_i() -> u32 {
 /// Write `words` as little-endian 32-bit instructions starting at `base`.
 pub fn load_words(mem: &mut Memory, base: u32, words: &[u32]) {
     for (i, w) in words.iter().enumerate() {
-        mem.store_u32(base + (i as u32) * 4, *w);
+        mem.poke_u32(base + (i as u32) * 4, *w);
     }
 }
 
 /// A CPU with `words` loaded at `base` and its PC set there.
 pub fn machine(base: u32, words: &[u32]) -> (Cpu, Memory) {
-    let mut mem = Memory::new();
+    let mut mem = Memory::permissive();
     load_words(&mut mem, base, words);
     let mut cpu = Cpu::new();
     cpu.set_pc(base);

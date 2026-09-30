@@ -66,6 +66,9 @@ pub enum StopReason {
 pub enum Trap {
     /// A fetch or taken control-flow target is not four-byte aligned.
     InstructionAddressMisaligned(u32),
+    /// A fetch or taken control-flow target names no mapped region, or one the
+    /// address space does not permit reading. Payload: the faulting address.
+    InstructionAccessFault(u32),
     /// The encoding at the current PC is not a valid RV32IMZicsr instruction,
     /// or it names a CSR this model does not implement. Payload: the encoding.
     IllegalInstruction(u32),
@@ -74,8 +77,14 @@ pub enum Trap {
     Breakpoint(u32),
     /// A load address does not meet the accessed value's alignment.
     LoadAddressMisaligned(u32),
+    /// A load names no mapped region, or one that does not permit reading.
+    /// Payload: the faulting address.
+    LoadAccessFault(u32),
     /// A store address does not meet the accessed value's alignment.
     StoreAddressMisaligned(u32),
+    /// A store names no mapped region, or one that does not permit writing.
+    /// Payload: the faulting address.
+    StoreAccessFault(u32),
     /// `ecall` was executed and a trap handler is installed. Payload: the PC of
     /// the `ecall`.
     EnvironmentCallFromM(u32),
@@ -90,10 +99,13 @@ impl Trap {
     pub fn mcause(&self) -> u32 {
         match self {
             Trap::InstructionAddressMisaligned(_) => 0,
+            Trap::InstructionAccessFault(_) => 1,
             Trap::IllegalInstruction(_) | Trap::Unsupported(_) => 2,
             Trap::Breakpoint(_) => 3,
             Trap::LoadAddressMisaligned(_) => 4,
+            Trap::LoadAccessFault(_) => 5,
             Trap::StoreAddressMisaligned(_) => 6,
+            Trap::StoreAccessFault(_) => 7,
             Trap::EnvironmentCallFromM(_) => 11,
         }
     }
@@ -102,8 +114,11 @@ impl Trap {
     pub fn mtval(&self) -> u32 {
         match self {
             Trap::InstructionAddressMisaligned(val)
+            | Trap::InstructionAccessFault(val)
             | Trap::LoadAddressMisaligned(val)
+            | Trap::LoadAccessFault(val)
             | Trap::StoreAddressMisaligned(val)
+            | Trap::StoreAccessFault(val)
             | Trap::Breakpoint(val) => *val,
             Trap::IllegalInstruction(encoding) => *encoding,
             // ECALL carries no address, and an unimplemented extension has no
@@ -229,7 +244,9 @@ impl Cpu {
             return self.handle_trap(Trap::InstructionAddressMisaligned(pc));
         }
 
-        let raw = mem.load_u32(pc);
+        let raw = mem
+            .fetch_u32(pc)
+            .map_err(|fault| Trap::InstructionAccessFault(fault.addr))?;
         let inst = isa::decode(raw);
         let outcome = match self.execute(inst, mem) {
             Ok(outcome) => outcome,
@@ -339,20 +356,23 @@ impl Cpu {
 
             isa::opcode::LOAD => {
                 let addr = self.x(rs1).wrapping_add(imm as u32);
+                let load = |m: &Memory, a: u32, n: u32| -> Result<u64, Trap> {
+                    m.load(a, n).map_err(|f| Trap::LoadAccessFault(f.addr))
+                };
                 let val = match funct3 {
-                    isa::funct3::LB => (mem.read_bytes(addr, 1) as u8 as i8) as i32 as u32,
+                    isa::funct3::LB => load(mem, addr, 1)? as u8 as i8 as i32 as u32,
                     isa::funct3::LH => {
                         require_alignment(addr, 2, Trap::LoadAddressMisaligned)?;
-                        (mem.read_bytes(addr, 2) as u16 as i16) as i32 as u32
+                        load(mem, addr, 2)? as u16 as i16 as i32 as u32
                     }
                     isa::funct3::LW => {
                         require_alignment(addr, 4, Trap::LoadAddressMisaligned)?;
-                        mem.read_bytes(addr, 4) as u32
+                        load(mem, addr, 4)? as u32
                     }
-                    isa::funct3::LBU => mem.read_bytes(addr, 1) as u32,
+                    isa::funct3::LBU => load(mem, addr, 1)? as u32,
                     isa::funct3::LHU => {
                         require_alignment(addr, 2, Trap::LoadAddressMisaligned)?;
-                        mem.read_bytes(addr, 2) as u32
+                        load(mem, addr, 2)? as u32
                     }
                     _ => return Err(Trap::IllegalInstruction(raw)),
                 };
@@ -364,15 +384,18 @@ impl Cpu {
             isa::opcode::STORE => {
                 let addr = self.x(rs1).wrapping_add(imm as u32);
                 let val = self.x(rs2);
+                let store = |m: &mut Memory, a: u32, n: u32, v: u64| -> Result<(), Trap> {
+                    m.store(a, n, v).map_err(|f| Trap::StoreAccessFault(f.addr))
+                };
                 match funct3 {
-                    isa::funct3::SB => mem.write_bytes(addr, 1, val as u64),
+                    isa::funct3::SB => store(mem, addr, 1, val as u64)?,
                     isa::funct3::SH => {
                         require_alignment(addr, 2, Trap::StoreAddressMisaligned)?;
-                        mem.write_bytes(addr, 2, val as u64);
+                        store(mem, addr, 2, val as u64)?;
                     }
                     isa::funct3::SW => {
                         require_alignment(addr, 4, Trap::StoreAddressMisaligned)?;
-                        mem.write_bytes(addr, 4, val as u64);
+                        store(mem, addr, 4, val as u64)?;
                     }
                     _ => return Err(Trap::IllegalInstruction(raw)),
                 }

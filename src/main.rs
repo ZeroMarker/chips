@@ -31,10 +31,13 @@ fn parse_u32(s: &str) -> Result<u32, String> {
 fn trap_cause_name(cause: u32) -> &'static str {
     match cause {
         0 => "instruction address misaligned",
+        1 => "instruction access fault",
         2 => "illegal instruction",
         3 => "breakpoint",
         4 => "load address misaligned",
+        5 => "load access fault",
         6 => "store address misaligned",
+        7 => "store access fault",
         11 => "environment call from M-mode",
         _ => "trap",
     }
@@ -77,8 +80,17 @@ fn main() -> ExitCode {
         None => DEFAULT_BUDGET,
     };
 
-    let mut mem = Memory::new();
-    mem.load_image(base, &bytes);
+    let mut mem = Memory::permissive();
+    if let Err(fault) = mem.load_image(base, &bytes) {
+        eprintln!(
+            "error: image does not fit the address space at 0x{base:08x} \
+             ({} bytes, {} fault at 0x{:08x})",
+            bytes.len(),
+            fault.access.name(),
+            fault.addr
+        );
+        return ExitCode::from(2);
+    }
 
     let mut cpu = Cpu::new();
     cpu.set_pc(base);

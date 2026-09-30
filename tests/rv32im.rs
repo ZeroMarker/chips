@@ -7,7 +7,7 @@ use chips::mem::Memory;
 /// Load a run of little-endian instruction words at `base`.
 fn load_words(mem: &mut Memory, base: u32, words: &[u32]) {
     for (i, w) in words.iter().enumerate() {
-        mem.store_u32(base + (i as u32) * 4, *w);
+        mem.poke_u32(base + (i as u32) * 4, *w);
     }
 }
 
@@ -28,7 +28,7 @@ fn addi_add_sw_lw_ebreak() {
         0x0010_0073, // ebreak
     ];
     let base = 0x1000u32;
-    let mut mem = Memory::new();
+    let mut mem = Memory::permissive();
     load_words(&mut mem, base, &prog);
 
     let mut cpu = Cpu::new();
@@ -62,7 +62,7 @@ fn branch_not_taken_and_jal() {
         0x0010_0073, // ebreak
     ];
     let base = 0x2000u32;
-    let mut mem = Memory::new();
+    let mut mem = Memory::permissive();
     load_words(&mut mem, base, &prog);
 
     let mut cpu = Cpu::new();
@@ -84,7 +84,7 @@ fn branch_not_taken_and_jal() {
 #[test]
 fn base_immediates_overflow() {
     // addi x5, x0, -20  (0xFEC, sign-extends to 0xFFFFFFEC)
-    let mut mem = Memory::new();
+    let mut mem = Memory::permissive();
     load_words(
         &mut mem,
         0x4000,
@@ -126,7 +126,7 @@ fn m_mul_div_rem() {
         0x0010_0073, // ebreak
     ];
     let base = 0x5000u32;
-    let mut mem = Memory::new();
+    let mut mem = Memory::permissive();
     load_words(&mut mem, base, &prog);
 
     let mut cpu = Cpu::new();
@@ -152,7 +152,7 @@ fn alternate_alu_encodings_sub_and_sra() {
         0x0010_0073, // ebreak
     ];
     let base = 0x6000;
-    let mut mem = Memory::new();
+    let mut mem = Memory::permissive();
     load_words(&mut mem, base, &prog);
     let mut cpu = Cpu::new();
     cpu.set_pc(base);
@@ -179,7 +179,7 @@ fn zicsr_register_and_immediate_operations() {
         0x0010_0073, // ebreak
     ];
     let base = 0x7000;
-    let mut mem = Memory::new();
+    let mut mem = Memory::permissive();
     load_words(&mut mem, base, &prog);
     let mut cpu = Cpu::new();
     cpu.set_pc(base);
@@ -213,7 +213,7 @@ fn zicsr_register_and_immediate_operations() {
 #[test]
 fn zicsr_rejects_writes_to_read_only_csrs() {
     let base = 0x8000;
-    let mut mem = Memory::new();
+    let mut mem = Memory::permissive();
     load_words(
         &mut mem,
         base,

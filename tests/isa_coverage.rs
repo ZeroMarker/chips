@@ -94,8 +94,8 @@ fn load_variants_sign_and_zero_extend() {
     ];
     let (mut cpu, mut mem) = machine(CODE, &prog);
     // Halfword 0xff80: bit 15 and bit 7 both set.
-    mem.write_u8(DATA, 0x80);
-    mem.write_u8(DATA + 1, 0xff);
+    mem.poke_u8(DATA, 0x80);
+    mem.poke_u8(DATA + 1, 0xff);
 
     assert_eq!(cpu.run(&mut mem, 100), Ok(StopReason::Ebreak));
     assert_eq!(cpu.reg(6), (-128i32) as u32, "lb sign-extends");
@@ -124,17 +124,13 @@ fn store_variants_write_little_endian() {
     let (mut cpu, mut mem) = machine(CODE, &prog);
 
     assert_eq!(cpu.run(&mut mem, 100), Ok(StopReason::Ebreak));
-    assert_eq!(mem.read_bytes(DATA, 4), 0x1234_5000, "sw writes a word");
-    assert_eq!(mem.read_u8(DATA), 0x00, "the word is little-endian");
-    assert_eq!(mem.read_u8(DATA + 3), 0x12);
+    assert_eq!(mem.peek(DATA, 4), 0x1234_5000, "sw writes a word");
+    assert_eq!(mem.peek_u8(DATA), 0x00, "the word is little-endian");
+    assert_eq!(mem.peek_u8(DATA + 3), 0x12);
+    assert_eq!(mem.peek(DATA + 4, 2), 0x5000, "sh writes the low halfword");
+    assert_eq!(mem.peek_u8(DATA + 6), 0x00, "sb writes the low byte");
     assert_eq!(
-        mem.read_bytes(DATA + 4, 2),
-        0x5000,
-        "sh writes the low halfword"
-    );
-    assert_eq!(mem.read_u8(DATA + 6), 0x00, "sb writes the low byte");
-    assert_eq!(
-        mem.read_u8(DATA + 7),
+        mem.peek_u8(DATA + 7),
         0x00,
         "bytes above the width are untouched"
     );
