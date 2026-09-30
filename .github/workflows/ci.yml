@@ -8,7 +8,7 @@ name: CI
 # What CI still cannot check is the ROADMAP P0 acceptance criterion proper
 # (running `riscv-tests` against the model *and* a hardware RTL peer, with Spike
 # as an external reference). No Spike, QEMU, Verilator, or RTL exists yet; see
-# TODO.md.
+# docs/TODO.md.
 
 on:
   push:

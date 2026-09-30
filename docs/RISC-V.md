@@ -1,8 +1,10 @@
 # RISC-V 参考
 
-本文档是本仓库的 RISC-V（精简指令集架构，第五代）技术参考。RISC-V 是开放、免授权费的指令集架构（ISA），采用可模块化扩展的设计：一个固定的基础整数 ISA 加上一组可选的扩展。
+本文档是 RISC-V（精简指令集架构，第五代）技术参考。RISC-V 是开放、免授权费的指令集架构（ISA），采用可模块化扩展的设计：一个固定的基础整数 ISA 加上一组可选的扩展。
 
-> 权威来源：
+> **定位**：背景知识，**不是**本项目状态的描述。本模型实际实现到哪一步见 [`TODO.md`](TODO.md)，本模型自身的设计见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，项目入口见 [`README.md`](../README.md)。
+>
+> 本文为规范摘要，**不替代权威来源**；实现与它冲突时以规范为准：
 > - The RISC-V Instruction Set Manual, Volume I: Unprivileged ISA（基础+非特权扩展）
 > - The RISC-V Instruction Set Manual, Volume II: Privileged Architecture（特权架构）
 > - 官方发布：https://riscv.org/technical/specifications/
@@ -184,7 +186,8 @@ loop:
 ## 8. 参考实现与规范
 
 - 官方规范（PDF/HTML）：https://riscv.org/technical/specifications/
-- RISC-V 指令手册仓库：https://github.com/riscv/riscv-isa-manual
-- 特权架构手册仓库：https://github.com/riscv/riscv-isa-manual
+- RISC-V 指令手册仓库（Volume I 与 Volume II 同仓）：https://github.com/riscv/riscv-isa-manual
 - 指令编码数据库：https://github.com/riscv/riscv-opcodes
 - 官方模拟器 Spike：https://github.com/riscv/riscv-isa-sim
+- 测试套件 `riscv-tests`：https://github.com/riscv/riscv-tests
+- UVM 生成器 `riscv-dv`：https://github.com/google/riscv-dv

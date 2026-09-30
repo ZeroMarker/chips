@@ -5,7 +5,7 @@
 //! file, a byte-addressable memory model, a CSR file with WARL field semantics,
 //! machine-mode trap entry through `mtvec`, and an execute loop. It is the
 //! reference against which the hardware RTL is differentially tested (see
-//! `ROADMAP.md`, phase P3).
+//! `docs/ROADMAP.md`, phase P3).
 //!
 //! Trap delivery is summarized in [`cpu`]: a non-zero `mtvec` means a handler is
 //! installed, `mepc`/`mcause`/`mtval` describe the cause, and `mret` unwinds.

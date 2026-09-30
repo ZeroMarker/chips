@@ -6,7 +6,7 @@
 #
 # This is the closest thing to ROADMAP phase P0's acceptance check that can run
 # without Spike or QEMU: the model consumes compiler-produced encodings instead
-# of hand-written ones.
+# of hand-written ones. See docs/ROADMAP.md phase P0.
 #
 # Usage: scripts/riscv-smoke.sh [--require]
 #

@@ -1,9 +1,10 @@
 # RISC-V 芯片研发路线图
 
-> 配套文档：`RISC-V.md`（ISA 技术参考）
+> **文档索引**：[`README.md`](../README.md)（项目入口）· [`ARCHITECTURE.md`](ARCHITECTURE.md)（模型设计）· [`ROADMAP.md`](ROADMAP.md)（本文，长期里程碑）· [`TODO.md`](TODO.md)（工作清单）· [`RISC-V.md`](RISC-V.md)（ISA 背景参考）
+>
 > 本路线图为「软硬件结合」路线：**Rust 功能模型**（黄金参考模型 + 验证骨架）与**硬件 RTL 实现**两条并行轨道，以**交叉验证**为耦合主线。
 >
-> 当前实现状态和按优先级排列的工作项见 [`TODO.md`](TODO.md)。路线图描述长期里程碑，TODO 清单记录可执行任务及其完成状态。
+> 路线图描述长期里程碑，具体可执行任务与完成状态见 [`TODO.md`](TODO.md)。本文档不记录实现细节——那在 [`ARCHITECTURE.md`](ARCHITECTURE.md)。
 
 ## 0. 目标与总体策略
 
@@ -46,9 +47,10 @@
   - `riscv-tests`（riscv-isa-sim 的测试集）与 `riscv-dv` 清单。
   - Verilator 用于 RTL 仿真；`pysim`/Cocotb 可选作 testbench。
 - 定义**验收基准**：目标是要能跑通哪一组程序（如 `rv32ui-p-*`、`rv32mi-p-*`）。
-- 确认本仓库的 `Cargo` 骨架与模块划分（`isa/`、`cpu/`、`mem/`、`csr/`、`tests/`）。
+- 确认本仓库的 `Cargo` 骨架与模块划分：`src/{isa,cpu,csr,mem,lib,main}.rs` 与 `tests/`（`isa`/`csr`/`mem` 为无状态依赖，`cpu` 为唯一有状态的执行核心）。
+- 用 `riscv64-unknown-elf-gcc` + `objcopy` 从裸机工程抽取裸二进制镜像，作为模型与 RTL 的共同输入格式。
 
-**验收**：`cargo build` 通过；能调用 Spike/QEMU 跑一条最小程序（如 `_start` + `wfi`）。
+**验收**：`cargo build` 通过；能跑一条最小程序。**当前状态**：`cargo build` 与 `riscv-smoke.sh`（汇编 `scripts/smoke.S` → 抽 `.text` → 模型运行 → 校验寄存器）已达成；「调用 Spike/QEMU」尚未达成，Spike 与 QEMU 均未引入，本仓库改用自有 CLI 驱动作为运行入口（见 `docs/TODO.md`）。
 
 ---
 
@@ -69,6 +71,8 @@
 
 **验收**：`rv32ui-p-*`、`rv32mi-p-*` 全绿；随机指令流下与 Spike 结果一致。
 
+**当前状态**：模型已实现 `RV32IMZicsr`（`src/isa.rs` 译码、`src/cpu.rs` 执行、`src/csr.rs` CSR 语义、`src/mem.rs` 内存），M 级陷阱进入与 `mret`，共 45 个 Rust 测试。`rv32ui-*`/`rv32mi-*` **尚未运行**——缺 runner 与目标平台定义；Spike 差分亦未开始。详见 [`ARCHITECTURE.md`](ARCHITECTURE.md) 与 [`TODO.md`](TODO.md)。
+
 ---
 
 ## 4. P2：RTL 单周期核（轨道 B）
@@ -81,6 +85,8 @@
 - 用 Verilator 编译并跑 `riscv-tests`（与 P1 相同的测试程序）。
 
 **验收**：单周期核通过 `rv32ui-*`/`rv32mi-*`；RTL 综合可用（yosys 不报严重时序/占用错误即可）。
+
+**当前状态**：未开始。本仓库当前无 RTL；P2 的第一步是 P1 的 `riscv-tests` runner 就位。
 
 ---
 
@@ -102,6 +108,8 @@
 
 **验收**：随机生成的数千指令流下，两轨道状态 100% 一致；至少一处真实缺陷（如对不齐、符号扩展）被差分测试捕获。
 
+**当前状态**：未开始（RTL 尚不存在）。但**前置条件已可提前准备**：差分测试需要模型输出稳定的每指令 trace（`PC`、指令、寄存器/CSR 变化、内存写入），该 trace 格式应先于 RTL 就位确定，否则 RTL 侧会被迫适配未冻结的格式。此项已列入 [`TODO.md`](TODO.md) 的 Next。
+
 ---
 
 ## 6. P4：扩展实现（M/A/F/D/C 等）
@@ -116,6 +124,8 @@
 每条扩展都遵循：**模型先行 → 差分验证 → RTL 实现 → 再差分**。
 
 **验收**：目标配置（如 RV32IMC）下，`riscv-tests` 全部通过且与 Spike 一致；浮点符合 IEEE 754（含舍入与 NaN 语义）。
+
+**当前状态**：`M` 扩展模型侧已完成（含除零与有符号最小值除 `-1` 的边界语义）。`A`/`F`/`D`/`C` 未开始——遇到相应编码时模型报 `Trap::Unsupported` 并指明缺失的扩展，而非静默出错。
 
 ---
 
@@ -185,6 +195,8 @@
 - [ ] 流水线核与模型功能等价
 - [ ] SoC boot 真实 `no_std` 程序，与 QEMU 输出一致
 - [ ] CI 全量回归全绿
+
+> 追踪中。前置的模型侧工作（`RV32IMZicsr`、M 级陷阱、CI、交叉工具链冒烟测试）已完成，但不单独构成本清单的条目——它们是 P1 的组成部分，清单衡量的是双轨一致性的终点。
 
 ---
 
