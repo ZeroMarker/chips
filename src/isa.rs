@@ -10,6 +10,62 @@ pub const XLEN: u32 = 32;
 /// Number of integer registers (`x0`–`x31`).
 pub const NUM_REGS: usize = 32;
 
+/// A privilege level.
+///
+/// The discriminants are the architectural encodings, and the ordering is
+/// meaningful: `User < Supervisor < Machine`, so "is this level at least as
+/// privileged as that one" is a `<=` and a CSR's required privilege is a lower
+/// bound rather than a set to walk.
+///
+/// Machine is 3 rather than 2 because that is what the architecture encodes and
+/// 2 is reserved. The derived ordering is still correct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Privilege {
+    /// Unprivileged. `ecall` from here is cause 8.
+    User = 0,
+    /// Supervisor. `ecall` from here is cause 9.
+    Supervisor = 1,
+    /// Machine. The reset level, and the only one always available.
+    Machine = 3,
+}
+
+impl Privilege {
+    /// Every level, least privileged first.
+    pub const ALL: [Privilege; 3] = [Privilege::User, Privilege::Supervisor, Privilege::Machine];
+
+    /// The level for an `xPP` field encoding, or `None` for the reserved value 2.
+    pub fn from_encoding(value: u32) -> Option<Privilege> {
+        match value {
+            0 => Some(Privilege::User),
+            1 => Some(Privilege::Supervisor),
+            3 => Some(Privilege::Machine),
+            _ => None,
+        }
+    }
+
+    /// The architectural encoding of this level.
+    pub fn encoding(self) -> u32 {
+        self as u32
+    }
+
+    /// A one-letter name, for diagnostics.
+    pub fn name(self) -> &'static str {
+        match self {
+            Privilege::User => "U",
+            Privilege::Supervisor => "S",
+            Privilege::Machine => "M",
+        }
+    }
+
+    /// May code running at `self` access a register requiring `required`?
+    ///
+    /// Delegation is deliberately not consulted: this model has no `medeleg`, so
+    /// nothing can be delegated and the rule is simply "at least as privileged".
+    pub fn can_access(self, required: Privilege) -> bool {
+        self >= required
+    }
+}
+
 /// ABI names for the 32 integer registers, indexed by register number.
 pub const REG_NAMES: [&str; NUM_REGS] = [
     "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1", "a2", "a3", "a4",

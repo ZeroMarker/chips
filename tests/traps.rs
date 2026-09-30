@@ -341,20 +341,15 @@ fn mie_masks_unsupported_bits_and_mip_is_inert() {
 }
 
 #[test]
-fn wfi_retires_and_privileged_encodings_are_illegal() {
+fn wfi_retires_in_every_mode() {
     let (mut cpu, mut mem) = machine(CODE, &[wfi(), ebreak()]);
     assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::Continue));
     assert_eq!(cpu.pc(), CODE + 4, "wfi advances the PC");
     assert_eq!(cpu.instret(), 1, "wfi is a legal, retiring instruction");
 
-    for bad in [sret(), 0x1200_0073 /* sfence.vma */] {
-        let (mut cpu, mut mem) = machine(CODE, &[bad]);
-        assert_eq!(
-            cpu.step(&mut mem),
-            Err(Trap::IllegalInstruction(bad)),
-            "0x{bad:08x} needs privilege this model does not have"
-        );
-    }
+    // `sret` and `sfence.vma` used to be illegal encodings here, because S-mode
+    // did not exist. They are legal from M now; the privilege gating is what
+    // tests/privilege.rs covers.
 }
 
 #[test]

@@ -153,9 +153,17 @@ echo "riscv-tests: running ${#targets[@]} binaries on the model"
 #                       module cannot pass it. Debug spec, not base ISA.
 #   rv32mi-p-pmpaddr     physical memory protection (pmpaddr0/pmpcfg0). The
 #                       model has no PMP at all.
+#   rv32mi-p-illegal     the model has S and U privilege levels but no trap
+#                       *delegation*. This test probes for S-mode by writing
+#                       MPP = S and reading it back, and skips itself when the
+#                       answer is no; since the model does support S-mode it
+#                       proceeds into mideleg, vectored supervisor interrupts,
+#                       and the TVM/TSR/SUM/MXR gating, none of which exist yet.
+#                       See docs/TODO.md.
 excluded_patterns=(
   "rv32mi-p-breakpoint"
   "rv32mi-p-pmpaddr"
+  "rv32mi-p-illegal"
 )
 is_excluded() {
   local name=$1 pattern

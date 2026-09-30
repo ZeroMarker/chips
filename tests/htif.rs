@@ -7,7 +7,7 @@
 
 mod common;
 
-use chips::cpu::{Cpu, StepOutcome, Trap};
+use chips::cpu::{Cpu, StepOutcome};
 use chips::htif::{Htif, Outcome};
 use chips::mem::Device;
 use chips::platform;
@@ -212,9 +212,11 @@ fn a_test_that_reports_through_the_device_stops_the_run() {
 }
 
 #[test]
-fn a_privilege_instruction_the_model_lacks_traps_rather_than_passing() {
-    // A guard on the runner's honesty: `sret` is not legal with only M-mode, so
-    // a program using it must not be able to reach a pass by accident.
+fn sret_from_machine_mode_is_legal_now_that_s_mode_exists() {
+    // Previously `sret` was an illegal encoding because S-mode did not exist.
+    // It is legal at M and above, and returns to SPP — which reads as U on a
+    // hart that has never left M, so this lands in user mode.
     let (mut cpu, mut mem) = machine(0x100, &[sret(), ebreak()]);
-    assert_eq!(cpu.step(&mut mem), Err(Trap::IllegalInstruction(sret())));
+    assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::Continue));
+    assert_eq!(cpu.privilege(), chips::isa::Privilege::User);
 }
