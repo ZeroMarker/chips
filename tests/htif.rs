@@ -124,7 +124,7 @@ fn the_platform_places_tohost_where_the_linker_puts_it() {
     // Most tests get tohost at 0x80001000, but a test whose .text.init exceeds
     // a page pushes it to the next boundary. Both must decode.
     for tohost in [0x8000_1000u32, 0x8000_2000, 0x8000_3000] {
-        let (mut mem, htif) = platform::riscv_tests(tohost);
+        let (mut mem, htif, _clint) = platform::riscv_tests(tohost);
         mem.store(tohost, 4, 1).expect("tohost is writable");
         assert_eq!(htif.outcome(), Outcome::Pass, "tohost at 0x{tohost:08x}");
     }
@@ -144,7 +144,7 @@ fn the_platform_rejects_a_nonsensical_tohost() {
 
 #[test]
 fn the_platform_covers_stack_ram_and_the_image() {
-    let (mem, _htif) = platform::riscv_tests(0x8000_1000);
+    let (mem, _htif, _clint) = platform::riscv_tests(0x8000_1000);
     let tohost = 0x8000_1000u32;
 
     // The reset vector, the device page, RAM above it, and stack RAM below.
@@ -183,7 +183,7 @@ fn a_test_that_reports_through_the_device_stops_the_run() {
     // the handler, which writes the result. The runner watches the device rather
     // than waiting for a halt, because the test never halts.
     let tohost = 0x8000_1000u32;
-    let (mut mem, htif) = platform::riscv_tests(tohost);
+    let (mut mem, htif, _clint) = platform::riscv_tests(tohost);
 
     let [hi, lo] = li32(1, tohost);
     load_words(

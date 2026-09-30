@@ -23,6 +23,7 @@
 //! writable memory-mapped `mtime` and the interrupt controller arrive with the
 //! SoC phase.
 
+pub mod clint;
 pub mod cpu;
 pub mod csr;
 pub mod htif;
@@ -30,6 +31,7 @@ pub mod isa;
 pub mod mem;
 pub mod platform;
 
+pub use clint::Clint;
 pub use cpu::{Cpu, StepOutcome, StopReason, Trap};
 pub use htif::{Htif, Outcome};
 pub use mem::{Access, AccessFault, Device, Memory, Permissions, Region};

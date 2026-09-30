@@ -146,6 +146,10 @@ pub struct Cpu {
     /// Set when the instruction being executed wrote `minstret`, so that
     /// instruction is not counted against the counter it just set.
     instret_written: bool,
+    /// The `mip` bits the address space's devices currently assert. Latched once
+    /// per step, before the interrupt check, so a handler that reads `mip` sees
+    /// the state that caused it to be entered.
+    mip: u32,
 }
 
 impl Default for Cpu {
@@ -166,6 +170,7 @@ impl Cpu {
             instret: 0,
             mtime: 0,
             instret_written: false,
+            mip: 0,
         }
     }
 
@@ -249,8 +254,24 @@ impl Cpu {
     pub fn step(&mut self, mem: &mut Memory) -> Result<StepOutcome, Trap> {
         let pc = self.pc;
         self.cycle = self.cycle.wrapping_add(1);
-        self.mtime = self.mtime.wrapping_add(1);
         self.instret_written = false;
+
+        // Refresh the values the interrupt controller owns before anything can
+        // observe them, and let it advance the time base. With no CLINT in the
+        // address space the model keeps its own counter, which is what an
+        // instruction-level test on permissive memory sees.
+        self.mip = mem.pending_interrupts() & Csr::mip_mask();
+        match mem.time_base() {
+            Some(t) => self.mtime = t,
+            None => self.mtime = self.mtime.wrapping_add(1),
+        }
+        mem.tick_time_base();
+
+        // An enabled, pending interrupt is taken before the next instruction
+        // starts, so `mepc` points at the instruction that did not run.
+        if let Some(cause) = self.pending_interrupt() {
+            return self.handle_interrupt(cause);
+        }
 
         if pc & 0b11 != 0 {
             return self.handle_trap(Trap::InstructionAddressMisaligned(pc));
@@ -272,6 +293,56 @@ impl Cpu {
         Ok(outcome)
     }
 
+    /// The cause of the interrupt that should be taken now, if any.
+    ///
+    /// An interrupt is taken when it is pending in `mip`, enabled in `mie`, and
+    /// the global enable `mstatus.MIE` is set. When several qualify, the highest
+    /// numbered wins, which is the platform's fixed priority: MEI (11) over MTI
+    /// (7) over MSI (3).
+    fn pending_interrupt(&self) -> Option<u32> {
+        let enabled = self.mip & self.csr.read(csr_addr::MIE);
+        if enabled == 0 || self.csr.read(csr_addr::MSTATUS) & MSTATUS_MIE == 0 {
+            return None;
+        }
+        // The highest set bit of `enabled`, as the bit's own value: for an
+        // interrupt, `mcause` *is* the bit number, not an index.
+        Some(1u32 << (31 - enabled.leading_zeros()))
+    }
+
+    /// Take an interrupt, entering the machine-mode handler.
+    ///
+    /// Differs from a synchronous exception in two ways that matter: `mcause` is
+    /// the interrupt bit rather than a reason code, and `mtval` is zero because
+    /// an interrupt has no faulting address. In vectored mode the entry point is
+    /// `mtvec` base + 4 * cause, which is the one case where vectoring applies.
+    fn handle_interrupt(&mut self, cause: u32) -> Result<StepOutcome, Trap> {
+        self.csr.write(csr_addr::MEPC, self.pc);
+        self.csr.write(csr_addr::MCAUSE, cause);
+        self.csr.write(csr_addr::MTVAL, 0);
+        self.push_interrupt_enable();
+
+        let mtvec = self.csr.read(csr_addr::MTVEC);
+        // Bit 0 of mtvec selects the mode: 1 is vectored, and only interrupts
+        // are ever vectored.
+        let entry = if mtvec & 0b11 == 1 {
+            mtvec.wrapping_add(4 * cause)
+        } else {
+            mtvec
+        };
+        self.pc = entry & !0b11;
+        Ok(StepOutcome::TrapTaken)
+    }
+
+    /// `MPIE <- MIE; MIE <- 0`, the interrupt-enable half of trap entry.
+    fn push_interrupt_enable(&mut self) {
+        let mstatus = self.csr.read(csr_addr::MSTATUS);
+        let mut next = mstatus & !(MSTATUS_MIE | MSTATUS_MPIE);
+        if mstatus & MSTATUS_MIE != 0 {
+            next |= MSTATUS_MPIE;
+        }
+        self.csr.write(csr_addr::MSTATUS, next);
+    }
+
     /// Deliver a trap, or report it when there is nowhere to deliver it.
     fn handle_trap(&mut self, trap: Trap) -> Result<StepOutcome, Trap> {
         if !self.handler_installed() {
@@ -285,21 +356,13 @@ impl Cpu {
             };
         }
 
-        let mtvec = self.csr.read(csr_addr::MTVEC);
         self.csr.write(csr_addr::MEPC, self.pc);
         self.csr.write(csr_addr::MCAUSE, trap.mcause());
         self.csr.write(csr_addr::MTVAL, trap.mtval());
-
-        // Entering M-mode: MPIE <- MIE, MIE <- 0. MPP is hardwired to M.
-        let mstatus = self.csr.read(csr_addr::MSTATUS);
-        let mut next = mstatus & !(MSTATUS_MIE | MSTATUS_MPIE);
-        if mstatus & MSTATUS_MIE != 0 {
-            next |= MSTATUS_MPIE;
-        }
-        self.csr.write(csr_addr::MSTATUS, next);
+        self.push_interrupt_enable();
 
         // A synchronous exception enters at BASE even in vectored mode.
-        self.pc = mtvec & !0b11;
+        self.pc = self.csr.read(csr_addr::MTVEC) & !0b11;
         Ok(StepOutcome::TrapTaken)
     }
 
@@ -505,8 +568,12 @@ impl Cpu {
             isa::system::ECALL if no_operands => Err(Trap::EnvironmentCallFromM(pc)),
             isa::system::EBREAK if no_operands => Err(Trap::Breakpoint(pc)),
             isa::system::MRET if no_operands => self.execute_mret(),
-            // WFI is legal in machine mode. With no interrupt controller to wait
-            // for, the model retires it immediately.
+            // WFI is legal in machine mode and is only a hint: it may complete
+            // immediately. Retiring it is not a shortcut past an interrupt,
+            // because the interrupt check happens at the start of the next step,
+            // so a pending enabled interrupt is still taken before whatever
+            // follows. An interrupt that is pending but *disabled* correctly
+            // does not disturb the wait.
             isa::system::WFI if no_operands => {
                 self.pc = pc.wrapping_add(4);
                 Ok(StepOutcome::Continue)
@@ -584,6 +651,8 @@ impl Cpu {
             csr_addr::MINSTRETH | csr_addr::INSTRETH => (self.instret >> 32) as u32,
             csr_addr::TIME => self.mtime as u32,
             csr_addr::TIMEH => (self.mtime >> 32) as u32,
+            // Driven by the interrupt controller, not stored.
+            csr_addr::MIP => self.mip,
             _ => self.csr.read(address),
         }
     }

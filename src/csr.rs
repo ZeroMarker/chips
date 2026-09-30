@@ -73,6 +73,11 @@ const MSTATUS_WRITABLE: u32 = MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP_M;
 /// privilege modes do not exist in this model.
 const MIE_WRITABLE: u32 = (1 << 11) | (1 << 7) | (1 << 3);
 
+/// `mip` bits a CLINT can assert: MSIP (3) and MTIP (7), plus MEIP (11) which a
+/// PLIC would drive. MEIP is listed because `mie` permits enabling it and a
+/// pending bit that could never be set would misrepresent the machine.
+const MIP_MASK: u32 = (1 << 11) | (1 << 7) | (1 << 3);
+
 /// `mepc` holds an instruction address; with IALIGN = 32 the low two bits are
 /// always zero.
 const MEPC_MASK: u32 = !0b11;
@@ -126,13 +131,16 @@ impl Csr {
     }
 
     /// Read a CSR, applying the register's read mask. Unwritten CSRs read as 0.
+    ///
+    /// `mip` is the one register whose value the CPU does not own: it belongs to
+    /// the interrupt controller. This returns the masked latch, and
+    /// [`crate::cpu::Cpu`] substitutes the live value when servicing a read.
     pub fn read(&self, csr: u32) -> u32 {
         let raw = self.data.get(&csr).copied().unwrap_or(0);
         match csr {
             // Fixed-value registers.
             addr::MISA => MISA_VALUE,
-            // No interrupt sources exist yet, so every pending bit reads zero.
-            addr::MIP => 0,
+            addr::MIP => raw & MIP_MASK,
             // MPP is hardwired to M; MIE/MPIE are normal storage.
             addr::MSTATUS => (raw & MSTATUS_WRITABLE) | MSTATUS_MPP_M,
             addr::MIE => raw & MIE_WRITABLE,
@@ -162,6 +170,15 @@ impl Csr {
             _ => val,
         };
         self.data.insert(csr, stored);
+    }
+
+    /// The `mip` bits this machine can ever report.
+    ///
+    /// Software cannot write `mip` — every bit belongs to an interrupt
+    /// controller — so this is the mask the CPU applies to the value it collects
+    /// from the address space.
+    pub fn mip_mask() -> u32 {
+        MIP_MASK
     }
 }
 

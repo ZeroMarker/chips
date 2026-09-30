@@ -114,10 +114,39 @@ pub trait Device: fmt::Debug {
 
     /// Write the low `8 * len` bits of `val` little-endian at `offset`.
     fn write(&self, offset: u32, len: u32, val: u64);
+
+    /// The `mip` bits this device currently asserts, or 0 if it raises no
+    /// interrupts.
+    ///
+    /// The CPU collects these from the whole address space once per step. A
+    /// device with no notion of interrupts — a plain HTIF mailbox, say — keeps
+    /// the default.
+    fn interrupt_pending(&self) -> u32 {
+        0
+    }
+
+    /// The 64-bit time base this device provides, if it is the one that does.
+    ///
+    /// A platform should have at most one CLINT. If several answer, the first
+    /// region in base order wins rather than the access being rejected: a
+    /// duplicated CLINT is a platform bug, and a panic here would be a poor way
+    /// to report one.
+    fn time_base(&self) -> Option<u64> {
+        None
+    }
+
+    /// Advance the time base by one instruction. A no-op for devices that have
+    /// no time base.
+    fn tick(&self) {}
 }
 
 /// A shared handle to a device is itself a device, which is what lets a caller
 /// keep its own [`Rc`] to a device the address space also holds.
+///
+/// Every method has to be forwarded explicitly. Leaving one to its default would
+/// fail silently and severely: a `Device` with no `interrupt_pending` override
+/// reports zero pending bits, so an `Rc`-wrapped CLINT would answer "no
+/// interrupts pending" and delivery would quietly never happen.
 impl<D: Device + ?Sized> Device for Rc<D> {
     fn read(&self, offset: u32, len: u32) -> u64 {
         (**self).read(offset, len)
@@ -125,6 +154,18 @@ impl<D: Device + ?Sized> Device for Rc<D> {
 
     fn write(&self, offset: u32, len: u32, val: u64) {
         (**self).write(offset, len, val)
+    }
+
+    fn interrupt_pending(&self) -> u32 {
+        (**self).interrupt_pending()
+    }
+
+    fn time_base(&self) -> Option<u64> {
+        (**self).time_base()
+    }
+
+    fn tick(&self) {
+        (**self).tick();
     }
 }
 
@@ -319,6 +360,49 @@ impl Memory {
     /// The regions, in ascending base order.
     pub fn regions(&self) -> &[Region] {
         &self.regions
+    }
+
+    /// The `mip` bits currently asserted by devices in this address space.
+    ///
+    /// Collected once per step by the CPU. A permissive address space has no
+    /// devices, so nothing is ever pending and interrupts cannot occur — which
+    /// is why interrupt tests need a platform with a CLINT.
+    pub fn pending_interrupts(&self) -> u32 {
+        self.regions
+            .iter()
+            .filter_map(|r| match &r.backing {
+                Backing::Device(device) => Some(device.interrupt_pending()),
+                _ => None,
+            })
+            .fold(0, |acc, bits| acc | bits)
+    }
+
+    /// The 64-bit time base, if this address space has a CLINT.
+    ///
+    /// `None` means there is none, in which case the caller falls back to its own
+    /// counter. That fallback is what [`Memory::permissive`] relies on: an
+    /// instruction-level test should not have to build a platform just to read
+    /// `time`.
+    pub fn time_base(&self) -> Option<u64> {
+        self.regions.iter().find_map(|r| match &r.backing {
+            Backing::Device(device) => device.time_base(),
+            _ => None,
+        })
+    }
+
+    /// Advance the time base by one instruction, if the address space has one.
+    ///
+    /// Called by the CPU at the start of each step. A no-op without a CLINT, so
+    /// the caller does not have to know whether one is present.
+    pub fn tick_time_base(&self) {
+        for region in &self.regions {
+            if let Backing::Device(device) = &region.backing {
+                if device.time_base().is_some() {
+                    device.tick();
+                    return;
+                }
+            }
+        }
     }
 
     /// Is every byte of `[addr, addr + len)` backed and permitted for `access`?

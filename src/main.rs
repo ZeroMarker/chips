@@ -165,7 +165,7 @@ fn main() -> ExitCode {
 /// which also means the run stops the instant the result lands rather than
 /// burning the remaining budget.
 fn run_htif(bytes: &[u8], base: u32, budget: u64, tohost: u32) -> ExitCode {
-    let (mut mem, htif) = platform::riscv_tests(tohost);
+    let (mut mem, htif, _clint) = platform::riscv_tests(tohost);
     if let Err(fault) = mem.load_image(base, bytes) {
         eprintln!(
             "error: image does not fit the riscv-tests platform at 0x{base:08x} \

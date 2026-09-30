@@ -8,6 +8,7 @@
 
 use std::rc::Rc;
 
+use crate::clint::{self, Clint};
 use crate::htif::Htif;
 use crate::mem::{Memory, Permissions, Region};
 
@@ -53,9 +54,14 @@ pub mod riscv_tests {
     pub const STACK_BASE: u32 = 0x8000_0000 - 0x0010_0000;
     /// 1 MiB of stack RAM.
     pub const STACK_SIZE: u64 = 0x0010_0000;
+
+    /// Base of the core-local interruptor. The SiFive FE310 placement, which is
+    /// what the rest of the world settled on; well clear of RAM at
+    /// `0x8000_0000`.
+    pub const CLINT_BASE: u32 = 0x0200_0000;
 }
 
-/// The `riscv-tests` platform: RAM, the HTIF pair, and stack RAM.
+/// The `riscv-tests` platform: RAM, the HTIF pair, a CLINT, and stack RAM.
 ///
 /// `tohost` cannot be a constant. `link.ld` places it at the first 4 KiB
 /// boundary after `.text.init`, so a test whose `.text.init` fits in a page
@@ -68,7 +74,7 @@ pub mod riscv_tests {
 /// resolves an address to the first region that covers it, so a device window
 /// drawn *inside* a RAM region would be unreachable and the suite would hang
 /// instead of reporting a result.
-pub fn riscv_tests(tohost: u32) -> (Memory, Rc<Htif>) {
+pub fn riscv_tests(tohost: u32) -> (Memory, Rc<Htif>, Rc<Clint>) {
     use riscv_tests as rt;
 
     assert!(
@@ -77,7 +83,15 @@ pub fn riscv_tests(tohost: u32) -> (Memory, Rc<Htif>) {
     );
 
     let htif = Rc::new(Htif::new());
+    let clint = Rc::new(Clint::new());
     let mem = Memory::from_regions(vec![
+        // The CLINT, at its conventional address, far below RAM.
+        Region::shared_device(
+            rt::CLINT_BASE,
+            clint::SIZE,
+            Permissions::READ_WRITE,
+            Rc::clone(&clint),
+        ),
         // Stack RAM, below the reset vector.
         Region::ram(rt::STACK_BASE, rt::STACK_SIZE, Permissions::READ_WRITE),
         // Everything from the reset vector up to the device page: `.text.init`,
@@ -97,5 +111,5 @@ pub fn riscv_tests(tohost: u32) -> (Memory, Rc<Htif>) {
             Permissions::READ_WRITE,
         ),
     ]);
-    (mem, htif)
+    (mem, htif, clint)
 }

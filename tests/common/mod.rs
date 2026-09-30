@@ -135,6 +135,11 @@ pub const fn csrrc(address: u32, rs1: u32, rd: u32) -> u32 {
     csr(0b011, address, rs1, rd)
 }
 
+/// `csrrwi rd, csr, uimm` — the five-bit immediate travels in the `rs1` field.
+pub const fn csrrwi(address: u32, uimm: u32, rd: u32) -> u32 {
+    csr(0b101, address, uimm & 0x1f, rd)
+}
+
 pub const fn ecall() -> u32 {
     0x0000_0073
 }
