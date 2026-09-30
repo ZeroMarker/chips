@@ -69,7 +69,11 @@ fn breakpoint_reports_cause_3_and_the_faulting_pc() {
 }
 
 #[test]
-fn misaligned_load_reports_cause_4_and_the_faulting_address() {
+fn a_misaligned_load_does_not_trap() {
+    // Misaligned data accesses are completed rather than trapped, so with a
+    // handler installed the load must run to completion and never reach it.
+    // `mcause` 4 is therefore unreachable in this model; the variant survives
+    // only because it is part of the architecture.
     let prog = [
         install_handler()[0],
         install_handler()[1],
@@ -82,15 +86,22 @@ fn misaligned_load_reports_cause_4_and_the_faulting_address() {
     for _ in 0..3 {
         assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::Continue));
     }
-    assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::TrapTaken));
     assert_eq!(
-        cpu.csr().read(csr_addr::MCAUSE),
-        4,
-        "load address misaligned"
+        cpu.step(&mut mem),
+        Ok(StepOutcome::Continue),
+        "a misaligned load completes rather than trapping"
     );
-    assert_eq!(cpu.csr().read(csr_addr::MTVAL), 3, "the faulting address");
-    assert_eq!(cpu.csr().read(csr_addr::MEPC), CODE + 12);
-    assert_eq!(cpu.reg(7), 0, "a trapping load writes no register");
+    assert_eq!(cpu.pc(), CODE + 16, "it advanced past the load");
+    assert_eq!(
+        cpu.csr().read(csr_addr::MEPC),
+        0,
+        "the handler was not entered"
+    );
+    // The `ebreak` *does* trap, because a handler is installed and so it is
+    // delivered rather than halting the run. That is the contrast being pinned
+    // down: the misaligned load above never reached the handler, this one does.
+    assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::TrapTaken));
+    assert_eq!(cpu.csr().read(csr_addr::MCAUSE), 3, "breakpoint");
 }
 
 #[test]
@@ -252,12 +263,16 @@ fn machine_counters_are_writable_and_aliased() {
     cpu.step(&mut mem).unwrap(); // csrrw minstret
     assert_eq!(
         cpu.instret(),
-        0x201,
-        "the writing instruction retires after its own write"
+        0x200,
+        "an instruction that writes minstret does not count itself"
     );
     cpu.step(&mut mem).unwrap(); // csrrs instret
-    assert_eq!(cpu.reg(7), 0x201);
-    assert_eq!(cpu.instret(), 0x202);
+    assert_eq!(
+        cpu.reg(7),
+        0x200,
+        "the read sees the value that was written"
+    );
+    assert_eq!(cpu.instret(), 0x201, "this one did retire");
     assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::Ebreak));
 }
 

@@ -144,19 +144,32 @@ fn an_access_running_past_the_end_of_a_region_faults() {
 }
 
 #[test]
-fn misalignedness_is_reported_before_the_fault() {
-    // A load that is both misaligned and unmapped reports the misalignment.
-    // The alignment check belongs to effective-address computation and happens
-    // first, so the access fault is never reached.
+fn an_unmapped_misaligned_load_reports_the_access_fault() {
+    // Misaligned data accesses are completed, not trapped, so the alignment of
+    // the address is no longer what decides the outcome. An address that is both
+    // misaligned and unmapped reports the access fault: there is no second,
+    // earlier check left to fire.
     let addr = materialize(1, NOWHERE + 1);
     let (mut cpu, mut mem) = machine(CODE, &[addr[0], addr[1], load(0, 1, 0b010, 2), ebreak()]);
 
     assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::Continue));
     assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::Continue));
-    assert_eq!(
-        cpu.step(&mut mem),
-        Err(Trap::LoadAddressMisaligned(NOWHERE + 1))
-    );
+    assert_eq!(cpu.step(&mut mem), Err(Trap::LoadAccessFault(NOWHERE + 1)));
+}
+
+#[test]
+fn a_misaligned_load_inside_mapped_memory_still_succeeds() {
+    // The counterpart: misalignment is no longer a fault at all, so the same
+    // encoding against a mapped address completes and reads across the boundary.
+    let data = CODE + 0x800;
+    let addr = materialize(1, data + 1);
+    let (mut cpu, mut mem) = machine(CODE, &[addr[0], addr[1], load(0, 1, 0b010, 2), ebreak()]);
+    mem.poke_u32(data + 1, 0xAABB_CCDD);
+
+    for _ in 0..3 {
+        assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::Continue));
+    }
+    assert_eq!(cpu.reg(2), 0xAABB_CCDD);
 }
 
 #[test]

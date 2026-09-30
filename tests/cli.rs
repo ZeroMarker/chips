@@ -110,25 +110,48 @@ fn accepts_a_decimal_start_address() {
 
 #[test]
 fn reports_a_trap_with_its_cause_and_mtval() {
-    let path = image(
-        "trap",
-        &[li(5, 3), load(0, 5, 0b010, 6), ebreak()], // lw x6, 0(x5) with x5 = 3
-    );
+    // A reserved `slli` encoding: `funct7` is not one the ISA defines, so this
+    // traps as an illegal instruction. It used to be a misaligned load, but
+    // misaligned data accesses are now completed rather than trapped.
+    let illegal = 0x0200_1013u32;
+    let path = image("trap", &[illegal, ebreak()]);
 
     let out = run(&[path.to_str().unwrap(), "0x1000"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
 
     assert_eq!(out.status.code(), Some(1), "a trap exits nonzero");
-    assert!(stderr.contains("LoadAddressMisaligned(3)"));
-    assert!(stderr.contains("mcause=4"));
-    assert!(stderr.contains("load address misaligned"));
-    assert!(stderr.contains("mtval=0x00000003"));
-    assert_eq!(
-        reg(&stdout, 6),
-        "00000000",
-        "a trapping load writes nothing"
+    assert!(stderr.contains("IllegalInstruction(33558547)"), "{stderr}");
+    assert!(stderr.contains("mcause=2"));
+    assert!(stderr.contains("illegal instruction"));
+    assert!(
+        stderr.contains("mtval=0x02001013"),
+        "an illegal instruction reports its own encoding as mtval"
     );
+    assert!(
+        stdout.contains("pc = 0x00001000"),
+        "a trap without a handler leaves the PC where it faulted"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_misaligned_load_is_completed_not_trapped() {
+    // The driver-level counterpart to the model-level test of the same name.
+    // `lw x6, 0(x5)` with `x5 = 3` reads across a word boundary and must
+    // succeed, so the run ends on the `ebreak` with exit code 0.
+    let path = image("misaligned", &[li(5, 3), load(0, 5, 0b010, 6), ebreak()]);
+
+    let out = run(&[path.to_str().unwrap(), "0x1000"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a completed misaligned load is not a failure"
+    );
+    assert!(stdout.contains("stopped: Ebreak"), "{stdout}");
 
     let _ = std::fs::remove_file(&path);
 }

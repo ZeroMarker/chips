@@ -25,8 +25,11 @@
 
 pub mod cpu;
 pub mod csr;
+pub mod htif;
 pub mod isa;
 pub mod mem;
+pub mod platform;
 
 pub use cpu::{Cpu, StepOutcome, StopReason, Trap};
-pub use mem::{Access, AccessFault, Memory, Permissions, Region};
+pub use htif::{Htif, Outcome};
+pub use mem::{Access, AccessFault, Device, Memory, Permissions, Region};

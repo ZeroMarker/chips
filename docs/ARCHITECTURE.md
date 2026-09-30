@@ -19,52 +19,63 @@
 
 ```
 src/
-  lib.rs    crate 文档与公开 API 再导出
-  isa.rs    ISA 常量、ABI 寄存器名、立即数解码、32 位译码
-  cpu.rs    CPU 状态与执行循环（取指 → 译码 → 执行 → 陷阱）
-  csr.rs    CSR 容器：地址表、只读判定、WARL 字段语义
-  mem.rs    稀疏字节可寻址内存
-  main.rs   命令行驱动：加载镜像、运行、转储状态
-tests/      集成测试（手工编码指令字 + 跨平台 CLI 测试）
+  lib.rs      crate 文档与公开 API 再导出
+  isa.rs      ISA 常量、ABI 寄存器名、立即数解码、32 位译码
+  cpu.rs      CPU 状态与执行循环（取指 → 译码 → 执行 → 陷阱）
+  csr.rs      CSR 容器：地址表、只读判定、WARL 字段语义
+  mem.rs      解码后的地址映射：区域、权限、访问故障、设备
+  htif.rs     HTIF `tohost`/`fromhost` 测试完成协议
+  platform.rs 预定义目标平台（`riscv-tests` 内存布局）
+  main.rs     命令行驱动：加载镜像、运行、转储状态
+tests/        集成测试（手工编码指令字 + 跨平台 CLI 测试）
 ```
 
-依赖方向是单向的，`isa` / `csr` / `mem` 都不依赖 `cpu`：
+依赖方向是单向的，`isa` / `csr` / `mem` / `htif` 都不依赖 `cpu`：
 
 ```
 main ──▶ cpu ──▶ isa
              ├─▶ csr
-             └─▶ mem
+             ├─▶ mem
+             └─▶ platform ──▶ htif
 ```
 
 - **`isa.rs`** 纯函数、无状态。`decode()` 把一个 32 位字拆成 `Decoded`（含按格式符号扩展的 `imm`）。立即数按指令格式重排（I/S/B/U/J），因此必须分别解码而不是直接取位。指令测试也复用这里的常量。
 - **`csr.rs`** 稀疏 CSR 文件，承载**字段**语义而非仅存储。计数器/时间类 CSR 在此登记为「存在」但不占存储，由 CPU 从自身状态提供。
-- **`mem.rs`** 稀疏 `BTreeMap<u32, u8>`，小端。通用 API 允许非对齐访问；**对齐规则由 CPU 在访存前强制**。
+- **`mem.rs`** 解码后的地址映射：小段 `Region` 列表，每段有基址、宽度、读写权限与后备（平坦 `Vec<u8>` 或稀疏 `BTreeMap`，或一个 `Device`）。未被任何段覆盖或被权限拒绝的访问产生 `AccessFault`。通用 API 允许非对齐访问。
+- **`htif.rs`** `riscv-tests` 的测试完成协议。测试不 halt，而是把结果码写入 `tohost` 后自旋，因此设备需要把 `sw` 写入的两个 32 位半字拼成 64 位命令。
+- **`platform.rs`** 把「链接脚本产出的内存布局」写成代码，使模型与套件按构造一致，而不是靠一条注释保持正确。
 - **`cpu.rs`** 唯一有状态的执行核心，见下。
 
 ## 3. 单步执行
 
 `Cpu::step()` 的一次调用严格按此顺序，任何一步失败都进入陷阱流程：
 
-1. `cycle` 与 `mtime` 各加一（在取指之前，因此陷阱步骤也计数）
+1. `cycle` 与 `mtime` 各加一（在取指之前，因此陷阱步骤也计数），并清除 `instret_written` 标志
 2. **取指对齐检查**：`pc & 0b11 != 0` → `InstructionAddressMisaligned`
-3. `mem.load_u32(pc)` 取指（4 字节小端）
+3. `mem.fetch_u32(pc)` 取指（4 字节小端），失败则 `InstructionAccessFault`
 4. `isa::decode()` 译码
-5. `execute()`：按 `opcode` 分派，产出 `StepOutcome`
-6. 若正常退休，`instret` 加一
+5. `execute()`：按 `opcode` 分派，产出 `StepOutcome`；访存失败产生对应的 `LoadAccessFault`/`StoreAccessFault`
+6. 若正常退休且本指令**未写入** `minstret`，`instret` 加一
 
 `Cpu::run()` 是 `step()` 的循环，直到 `ecall`/`ebreak`（无处理程序时）或指令预算用尽。**陷阱不终止循环**——若安装了处理程序，模型会继续执行处理程序。
 
 ### 计数器语义
 
-`cycle` 计**尝试的**步骤数（含陷阱步骤），`instret` 计**成功退休**的指令数。`ebreak` 不退休。二者在 `architecture.rs` 中有专门测试。
+`cycle` 计**尝试的**步骤数（含陷阱步骤），`instret` 计**成功退休**的指令数。`ebreak` 不退休。
+
+**写入 `minstret` 抑制该指令自身的计数增量**——它刚写下的值就是下一个读者应看到的值，而不是再加一。这条规则由 `riscv-tests` 的 `instret_overflow` 检查，写 `minstreth` 同样抑制。注意 `mcycle` **不**有这条豁免。二者在 `architecture.rs` 中有专门测试。
 
 ### 对齐检查的分工
 
-- 取指与**被采取的**控制流目标（`jal`/`jalr`/已采取的分支）要求 4 字节对齐 → `InstructionAddressMisaligned`
+- 取指与**被采取的**控制流目标（`jal`/`jalr`/已采取的分支）要求 4 字节对齐 → `InstructionAddressMisaligned`。这在 IALIGN = 32 下是**架构强制**的，不是实现可选项；加入 `C` 扩展后 IALIGN 降为 16，规则随之改变。
 - `jalr` 目标先按规范屏蔽最低位（`& !1`），再检查 4 字节对齐
 - **未采取的分支不检查目标**——不检查就不会触发陷阱
-- `lh`/`lw`/`sh`/`sw` 按访问宽度检查 → `LoadAddressMisaligned` / `StoreAddressMisaligned`
-- `lb`/`lbu`/`sb` 宽度为 1，天然对齐
+
+### 非对齐数据访问：完成，而非陷阱
+
+基础 ISA 把非对齐 load/store 的行为留给实现（「可以支持」）。本模型**选择完成它们**，与 Spike、QEMU 和真实硬件一致，原因有二：差分测试要与之比对，而 `riscv-tests` 的 `ma_data` 直接要求正确读出跨边界的数据。
+
+因此 `Trap::LoadAddressMisaligned`（`mcause` 4）与 `Trap::StoreAddressMisaligned`（`mcause` 6）在本模型中**不可达**。两个变体仍保留，因为它们是架构的一部分，且未来实现可能选择陷阱。内存模型本身按字节小端访问，所以完成语义是自然结果，不需要额外代码。
 
 ## 4. 陷阱模型
 
@@ -107,10 +118,13 @@ PC   <- mepc
 | 变体 | `mcause` | `mtval` |
 |------|---------|---------|
 | `InstructionAddressMisaligned(a)` | 0 | 故障地址 |
+| `InstructionAccessFault(a)` | 1 | 故障地址 |
 | `IllegalInstruction(enc)` | 2 | **故障编码本身** |
 | `Breakpoint(pc)` | 3 | `ebreak` 的 PC |
-| `LoadAddressMisaligned(a)` | 4 | 故障地址 |
-| `StoreAddressMisaligned(a)` | 6 | 故障地址 |
+| `LoadAddressMisaligned(a)` | 4 | 故障地址（本模型不产生，见上） |
+| `LoadAccessFault(a)` | 5 | 故障地址 |
+| `StoreAddressMisaligned(a)` | 6 | 故障地址（本模型不产生） |
+| `StoreAccessFault(a)` | 7 | 故障地址 |
 | `EnvironmentCallFromM(pc)` | 11 | 0（ecall 不携带地址） |
 | `Unsupported(ext)` | 2 | 0 |
 
@@ -161,36 +175,59 @@ CSR 的正确性集中在三件事，缺一不可。
 
 ## 7. 内存模型
 
-`Memory` 是稀疏 `BTreeMap<u32, u8>`，小端，**任意地址都可写**，未写过的地址读 0。
+`Memory` 是一组 `Region`，按基址排序，每个区域有基址、宽度（`u64`，因为整个 32 位地址空间需要 2^32 字节，装不进 `u32`）、读写权限，以及平坦或稀疏后备。地址被解析到**第一个覆盖它**的区域，因此设备页必须与 RAM 区域**不重叠**，否则永远不会被访问到。
 
-这个选择让算术测试无需操心地址空间，对 ISA 语义验证是正确的；但它**无法建模未映射区域**，因此也没有访问故障（`LoadAccessFault`/`StoreAccessFault`）。同时逐字节 `BTreeMap` 访问对全量测试套件偏慢。TODO 中已记录：需要给内存模型加解码后的地址映射。
+- `Memory::permissive()`：整个地址空间、一段稀疏、读写全开。没有任何访问会故障——指令级测试关心的是算术而非地址布局，不该为「我的地址落在哪」分心。
+- `Memory::from_regions(...)`：装入真实映射，未映射区域与权限不足都会产生 `AccessFault`。
 
-`load_image()` 逐字节把裸镜像装到基址——这正是 CLI 加载 raw binary 的方式。
+**访存（guest access）与装载（host setup）是两回事。** 访存可故障，因为那是架构可观察的行为。把程序装进内存不是 guest 做的事，也不该能故障，所以 `poke`/`peek` 系列不做检查，遇到未映射地址直接 panic——那是调用方的 bug，不是 guest 能观察到的行为。
 
-## 8. 不变式与安全网
+**访问不得跨区域**：一个访问必须完全落在单个区域内。起点在内但越过了区域末尾 → 故障，而不是去读下一个区域。
+
+`load_image` 是唯一的例外：镜像本身可以跨区域（`riscv-tests` 的二进制同时覆盖 `.text.init` 页与 `tohost` 页），因为它是逐字节装载的，这与「单次 guest 访问不得跨界」是两个不同的问题。
+
+## 8. 测试完成协议（HTIF）
+
+`riscv-tests` 不 halt。`RVTEST_PASS` 写 `1`，`RVTEST_FAIL` 写 `(check << 1) | 1`，然后自旋；遇到无法处理的异常则把 `1337` 或进测试号后**原样**写入（不走那个编码）。因此：
+
+- `tohost` 是 64 位，但测试用 `sw` 逐字写：先低半字，再向高半字写 0。设备必须**拼装**两个半字，而不是把一次写当成整寄存器写。
+- `1` 为通过；大于 1 的奇数是失败并指明第几项检查；`1337` 标记表示「发生了意外异常」。
+- 编码本身有歧义：`(668 << 1) | 1 == 1337`，所以「第 668 项检查失败」与「意外异常」不可区分。模型报告后者（更可能是真实原因，也更有指导意义）。现有套件没有编号 668 的检查，实践上无损失。
+
+驱动在 `--htif` 下逐条 `step` 并在每条之后检查设备，因此结果一落定就停止，而不是烧完剩余预算。
+
+## 9. 不变式与安全网
 
 以下性质由测试固定，是修改模型时的回归依据：
 
 - `x0` 恒为 0，写入被丢弃
 - 采取的跳转若触发陷阱，**不得**写链接寄存器（`architecture.rs`）
-- 陷阱的访存无副作用（`architecture.rs` 检查对齐失败的 store 未改内存）
+- 陷阱的访存无副作用（`architecture.rs` 检查对齐失败的跳转未改状态）
 - 未采取的分支不检查目标对齐
 - 保留编码（`slli`/`srli` 的保留 `funct7`、`jalr` 的保留 `funct3`、`fence` 的保留 `fm`、`ecall` 的非零 `rd`）产生非法指令，且 `mtval` 为其自身编码
 - `ebreak` 不退休
+- 写入 `minstret` 抑制该指令自身的计数增量（`architecture.rs`）
+- 非对齐数据访问完成而非陷阱，且只写自己宽度覆盖的字节（`architecture.rs`）
+- 访问不得跨区域；设备页与 RAM 不重叠（`memory.rs`、`htif.rs`）
+- 未映射/无权限访问产生正确的 `mcause`（1/5/7）并经处理程序正确路由（`memory.rs`）
+- `tohost` 的拼装与解码，包括 `1337` 标记与 `check 668` 的编码歧义（`htif.rs`）
 - debug 与 release 结果一致（模型依赖环绕运算，release 关闭溢出检查）——CI 两个 profile 都跑
 
-## 9. 已知限制
+### 官方套件
+
+上述不变量之外，`scripts/riscv-tests.sh` 跑官方 `rv32ui-p-*` 与 `rv32mi-p-*`。它比任何手写测试都更容易发现语义偏差——本项目中被它抓出的两处（`minstret` 抑制、非对齐数据访问）都不是靠推理想到的。修改执行语义后应先跑它。
+
+## 10. 已知限制
 
 按对验证工作的阻塞程度排列，与 [`TODO.md`](TODO.md) 的优先级一致：
 
-1. **无 `riscv-tests` runner**。这是通往 P0 验收标准的主要缺口：需要 `tohost`/`ecall` pass-fail 约定的 runner 与目标平台定义。CI 目前只跑一个程序。
-2. **无中断交付**。`mip` 恒读 0，无 CLINT/PLIC，无内存映射 `mtime`；`wfi` 立即退休。
-3. **仅 M 特权级**。`mstatus.MPP` 硬连线为 M，`sret`/`sfence.vma` 为非法编码，`ecall` 固定报告 M 级。
-4. **内存无地址映射**。见上一节。
-5. **无指令级 trace**。P3 差分测试需要稳定的每指令 trace（PC、指令、寄存器/CSR 变化、内存写入），当前没有。
-6. **无外部参考**。Spike 未引入，差分测试缺裁判。
+1. **无中断交付**。`mip` 恒读 0，无 CLINT/PLIC，无内存映射 `mtime`；`wfi` 立即退休。
+2. **仅 M 特权级**。`mstatus.MPP` 硬连线为 M，`sret`/`sfence.vma` 为非法编码，`ecall` 固定报告 M 级。
+3. **无 PMP 与调试触发模块**。因此 `rv32mi-p-pmpaddr` 与 `rv32mi-p-breakpoint` 在 runner 中列为 excluded 而非通过。
+4. **无指令级 trace**。P3 差分测试需要稳定的每指令 trace（PC、指令、寄存器/CSR 变化、内存写入），当前没有。这是 P3 的前置条件：格式应先于 RTL 冻结。
+5. **无外部参考**。Spike 未引入（且不在 apt 源中），差分测试缺裁判。
 
-## 10. 扩展模型的方式
+## 11. 扩展模型的方式
 
 按以下顺序，每步都应先有测试：
 
@@ -198,5 +235,7 @@ CSR 的正确性集中在三件事，缺一不可。
 2. 在 `csr.rs` 若涉及 CSR：加入 `exists()`，按需处理只读与 WARL
 3. 在 `cpu.rs` 的 `execute()` 加分派分支
 4. 若新扩展的编码当前落在 `Unsupported` 分支，**替换掉**该分支——否则新指令永远到不了你的分派
-5. 在 `tests/common/mod.rs` 加编码器，写表驱动测试
-6. 更新本文档与 `misa`（若扩展有 `misa` 位）
+5. 若涉及新设备：在 `mem.rs` 实现 `Device`（注意访问以**整块**形式传入，设备才能看到宽度），并在 `platform.rs` 中安排区域**不重叠**
+6. 在 `tests/common/mod.rs` 加编码器，写表驱动测试
+7. 跑 `scripts/riscv-tests.sh`——官方套件常能发现手写测试想不到的语义偏差
+8. 更新本文档与 `misa`（若扩展有 `misa` 位）

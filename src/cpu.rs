@@ -76,11 +76,18 @@ pub enum Trap {
     /// the `ebreak`.
     Breakpoint(u32),
     /// A load address does not meet the accessed value's alignment.
+    ///
+    /// This model does **not** raise this: it completes misaligned data accesses
+    /// instead, which the base ISA permits and `riscv-tests`' `ma_data`
+    /// requires. The variant stays because `mcause` 4 is part of the
+    /// architecture and a future implementation may prefer to trap.
     LoadAddressMisaligned(u32),
     /// A load names no mapped region, or one that does not permit reading.
     /// Payload: the faulting address.
     LoadAccessFault(u32),
     /// A store address does not meet the accessed value's alignment.
+    ///
+    /// As with [`Trap::LoadAddressMisaligned`], not raised by this model.
     StoreAddressMisaligned(u32),
     /// A store names no mapped region, or one that does not permit writing.
     /// Payload: the faulting address.
@@ -136,6 +143,9 @@ pub struct Cpu {
     cycle: u64,
     instret: u64,
     mtime: u64,
+    /// Set when the instruction being executed wrote `minstret`, so that
+    /// instruction is not counted against the counter it just set.
+    instret_written: bool,
 }
 
 impl Default for Cpu {
@@ -155,6 +165,7 @@ impl Cpu {
             cycle: 0,
             instret: 0,
             mtime: 0,
+            instret_written: false,
         }
     }
 
@@ -239,6 +250,7 @@ impl Cpu {
         let pc = self.pc;
         self.cycle = self.cycle.wrapping_add(1);
         self.mtime = self.mtime.wrapping_add(1);
+        self.instret_written = false;
 
         if pc & 0b11 != 0 {
             return self.handle_trap(Trap::InstructionAddressMisaligned(pc));
@@ -252,7 +264,9 @@ impl Cpu {
             Ok(outcome) => outcome,
             Err(trap) => return self.handle_trap(trap),
         };
-        if outcome == StepOutcome::Continue {
+        // An instruction that wrote `minstret` does not count itself: the value
+        // it wrote is what the next reader must see, not one more than that.
+        if outcome == StepOutcome::Continue && !self.instret_written {
             self.instret = self.instret.wrapping_add(1);
         }
         Ok(outcome)
@@ -361,19 +375,10 @@ impl Cpu {
                 };
                 let val = match funct3 {
                     isa::funct3::LB => load(mem, addr, 1)? as u8 as i8 as i32 as u32,
-                    isa::funct3::LH => {
-                        require_alignment(addr, 2, Trap::LoadAddressMisaligned)?;
-                        load(mem, addr, 2)? as u16 as i16 as i32 as u32
-                    }
-                    isa::funct3::LW => {
-                        require_alignment(addr, 4, Trap::LoadAddressMisaligned)?;
-                        load(mem, addr, 4)? as u32
-                    }
+                    isa::funct3::LH => load(mem, addr, 2)? as u16 as i16 as i32 as u32,
+                    isa::funct3::LW => load(mem, addr, 4)? as u32,
                     isa::funct3::LBU => load(mem, addr, 1)? as u32,
-                    isa::funct3::LHU => {
-                        require_alignment(addr, 2, Trap::LoadAddressMisaligned)?;
-                        load(mem, addr, 2)? as u32
-                    }
+                    isa::funct3::LHU => load(mem, addr, 2)? as u32,
                     _ => return Err(Trap::IllegalInstruction(raw)),
                 };
                 self.write_rd(rd, val);
@@ -389,14 +394,8 @@ impl Cpu {
                 };
                 match funct3 {
                     isa::funct3::SB => store(mem, addr, 1, val as u64)?,
-                    isa::funct3::SH => {
-                        require_alignment(addr, 2, Trap::StoreAddressMisaligned)?;
-                        store(mem, addr, 2, val as u64)?;
-                    }
-                    isa::funct3::SW => {
-                        require_alignment(addr, 4, Trap::StoreAddressMisaligned)?;
-                        store(mem, addr, 4, val as u64)?;
-                    }
+                    isa::funct3::SH => store(mem, addr, 2, val as u64)?,
+                    isa::funct3::SW => store(mem, addr, 4, val as u64)?,
                     _ => return Err(Trap::IllegalInstruction(raw)),
                 }
                 self.pc = pc.wrapping_add(4);
@@ -596,27 +595,31 @@ impl Cpu {
         match address {
             csr_addr::MCYCLE => self.cycle = (self.cycle & !0xFFFF_FFFF) | value as u64,
             csr_addr::MCYCLEH => self.cycle = (self.cycle & 0xFFFF_FFFF) | ((value as u64) << 32),
-            csr_addr::MINSTRET => self.instret = (self.instret & !0xFFFF_FFFF) | value as u64,
+            csr_addr::MINSTRET => {
+                self.instret = (self.instret & !0xFFFF_FFFF) | value as u64;
+                self.instret_written = true;
+            }
             csr_addr::MINSTRETH => {
-                self.instret = (self.instret & 0xFFFF_FFFF) | ((value as u64) << 32)
+                self.instret = (self.instret & 0xFFFF_FFFF) | ((value as u64) << 32);
+                self.instret_written = true;
             }
             _ => self.csr.write(address, value),
         }
     }
 }
 
-#[inline]
-fn require_alignment(addr: u32, alignment: u32, trap: fn(u32) -> Trap) -> Result<(), Trap> {
-    if addr & (alignment - 1) == 0 {
-        Ok(())
-    } else {
-        Err(trap(addr))
-    }
-}
-
+/// With IALIGN = 32 an instruction address must be four-byte aligned.
+///
+/// This is architecturally fixed, not implementation-defined, so unlike misaligned
+/// *data* accesses it always traps. With the `C` extension IALIGN drops to 16 and
+/// this rule changes with it.
 #[inline]
 fn require_instruction_alignment(addr: u32) -> Result<(), Trap> {
-    require_alignment(addr, 4, Trap::InstructionAddressMisaligned)
+    if addr & 0b11 == 0 {
+        Ok(())
+    } else {
+        Err(Trap::InstructionAddressMisaligned(addr))
+    }
 }
 
 #[inline]

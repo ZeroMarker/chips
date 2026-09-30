@@ -1,14 +1,14 @@
 name: CI
 
-# Gates every change with formatting, lints, tests, and — most importantly — a
-# real cross-toolchain run of the model. `riscv-smoke` is the end-to-end check
-# that the Clippy-and-unit-tests jobs cannot give: compiler-produced RV32IM
-# encodings executed by the golden model.
+# Gates every change with formatting, lints, tests, and — most importantly — real
+# runs of the model. `riscv-smoke` is the end-to-end check that the
+# Clippy-and-unit-tests jobs cannot give: compiler-produced RV32IM encodings
+# executed by the golden model. `riscv-tests` goes further and runs the official
+# conformance suites.
 #
-# What CI still cannot check is the ROADMAP P0 acceptance criterion proper
-# (running `riscv-tests` against the model *and* a hardware RTL peer, with Spike
-# as an external reference). No Spike, QEMU, Verilator, or RTL exists yet; see
-# docs/TODO.md.
+# What CI still cannot check is the ROADMAP P3 acceptance criterion proper:
+# comparing the model against a hardware RTL peer, with Spike as an external
+# reference. No Spike, QEMU, Verilator, or RTL exists yet; see docs/TODO.md.
 
 on:
   push:
@@ -101,3 +101,31 @@ jobs:
       # bash so a checkout without the executable bit still works.
       - name: Assemble scripts/smoke.S and run it on the model
         run: bash scripts/riscv-smoke.sh --require
+
+  riscv-tests:
+    name: riscv-tests conformance suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The same cross toolchain as riscv-smoke. riscv-tests additionally needs
+      # these to run its autoconf configure step.
+      - name: Install the RISC-V cross toolchain and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            gcc-riscv64-unknown-elf \
+            autoconf automake libmpc-dev libgmp-dev texinfo device-tree-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # This is the ROADMAP P0/P1 acceptance criterion: the official rv32ui and
+      # rv32mi suites running on the model, reporting through the tohost
+      # convention. Two tests are reported as excluded rather than passed,
+      # because they need facilities the model does not implement (the debug
+      # trigger module and PMP); the script names them and fails on anything
+      # else, so a real regression cannot hide behind them.
+      - name: Build and run rv32ui-p-* and rv32mi-p-*
+        run: bash scripts/riscv-tests.sh --require

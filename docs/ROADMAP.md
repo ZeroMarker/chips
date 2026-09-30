@@ -50,7 +50,7 @@
 - 确认本仓库的 `Cargo` 骨架与模块划分：`src/{isa,cpu,csr,mem,lib,main}.rs` 与 `tests/`（`isa`/`csr`/`mem` 为无状态依赖，`cpu` 为唯一有状态的执行核心）。
 - 用 `riscv64-unknown-elf-gcc` + `objcopy` 从裸机工程抽取裸二进制镜像，作为模型与 RTL 的共同输入格式。
 
-**验收**：`cargo build` 通过；能跑一条最小程序。**当前状态**：`cargo build` 与 `riscv-smoke.sh`（汇编 `scripts/smoke.S` → 抽 `.text` → 模型运行 → 校验寄存器）已达成；「调用 Spike/QEMU」尚未达成，Spike 与 QEMU 均未引入，本仓库改用自有 CLI 驱动作为运行入口（见 `docs/TODO.md`）。
+**验收**：`cargo build` 通过；能跑一条最小程序。**当前状态**：**已达成**。`cargo build` 通过，`scripts/riscv-smoke.sh`（汇编 `scripts/smoke.S` → 抽 `.text` → 模型运行 → 校验寄存器）在本地与 CI 均通过；`scripts/riscv-tests.sh` 进一步运行官方 `rv32ui-p-*`/`rv32mi-p-*` 套件。「调用 Spike/QEMU」一项**未达成**：Spike 与 QEMU 均未引入（`spike` 不在 apt 源中），本仓库改用自有 CLI 驱动作为运行入口。
 
 ---
 
@@ -71,7 +71,7 @@
 
 **验收**：`rv32ui-p-*`、`rv32mi-p-*` 全绿；随机指令流下与 Spike 结果一致。
 
-**当前状态**：模型已实现 `RV32IMZicsr`（`src/isa.rs` 译码、`src/cpu.rs` 执行、`src/csr.rs` CSR 语义、`src/mem.rs` 内存），M 级陷阱进入与 `mret`，共 45 个 Rust 测试。`rv32ui-*`/`rv32mi-*` **尚未运行**——缺 runner 与目标平台定义；Spike 差分亦未开始。详见 [`ARCHITECTURE.md`](ARCHITECTURE.md) 与 [`TODO.md`](TODO.md)。
+**当前状态**：模型侧已完成 `RV32IMZicsr`（`src/isa.rs` 译码、`src/cpu.rs` 执行、`src/csr.rs` CSR 语义、`src/mem.rs` 解码地址映射），M 级陷阱进入与 `mret`，75 个 Rust 测试。**`rv32ui-p-*` 42/42 通过；`rv32mi-p-*` 14/16 通过**，2 个（`breakpoint` 需调试触发模块、`pmpaddr` 需 PMP）因设施未实现而排除，见 `scripts/riscv-tests.sh`。**Spike 差分尚未开始。** 官方套件还暴露并已修正两处语义缺陷（`minstret` 写入抑制、非对齐数据访问完成而非陷阱），说明它比手写测试更容易发现偏差。详见 [`ARCHITECTURE.md`](ARCHITECTURE.md) 与 [`TODO.md`](TODO.md)。
 
 ---
 
@@ -196,7 +196,7 @@
 - [ ] SoC boot 真实 `no_std` 程序，与 QEMU 输出一致
 - [ ] CI 全量回归全绿
 
-> 追踪中。前置的模型侧工作（`RV32IMZicsr`、M 级陷阱、CI、交叉工具链冒烟测试）已完成，但不单独构成本清单的条目——它们是 P1 的组成部分，清单衡量的是双轨一致性的终点。
+> 追踪中。模型侧的等价性前提已大体就位：官方套件 56/58 通过（2 个因缺 PMP 与调试触发模块而排除）。但本清单衡量的是**双轨一致性的终点**，模型单方面通过套件不构成其中任何一条——第一条尤其需要 RTL 存在。
 
 ---
 

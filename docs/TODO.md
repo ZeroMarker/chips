@@ -21,15 +21,20 @@ Rust 黄金参考模型及其未来 RTL 对应实现的工作台账。条目按�
 - [x] 补齐 [`README.md`](../README.md)：构建、测试、裸二进制生成、CLI 用法、CI 覆盖与不覆盖范围。
 - [x] 补充 [`ARCHITECTURE.md`](ARCHITECTURE.md)：模块划分、单步执行、陷阱与 CSR 语义、内存模型、不变式与扩展指引。
 - [x] 文档结构重整：文档统一为中文，路线图/清单/背景参考移入 `docs/`，交叉引用与代码注释同步更新。
+- [x] 给内存模型加入解码后的地址映射与访问故障（`InstructionAccessFault`/`LoadAccessFault`/`StoreAccessFault`），并为 RAM 提供 O(1) 的平坦后备（`src/mem.rs`、`tests/memory.rs`）。
+- [x] 实现 HTIF `tohost`/`fromhost` 协议与 `riscv-tests` 目标平台定义（`src/htif.rs`、`src/platform.rs`）。
+- [x] 把工具链冒烟测试扩展为真正的 `riscv-tests` runner：`scripts/riscv-tests.sh` 克隆、配置（XLEN=32）、构建并运行 `rv32ui-p-*`/`rv32mi-p-*`，经 `--htif` 读取 `tohost` 判定 pass/fail。**58 个测试中 56 个通过，2 个 excluded。**
+- [x] 将 `riscv-tests` 接入 CI（`riscv-tests` job）。
+- [x] 修正两处由官方套件暴露的架构缺陷：写入 `minstret` 必须抑制该指令自身的计数增量（`instret_overflow`）；非对齐**数据**访问应当完成而非陷阱（`ma_data`）。
 
 ## 接下来
 
-- [ ] 把工具链冒烟测试扩展为真正的 `riscv-tests` `rv32ui`/`rv32mi` runner（`tohost`/`ecall` pass-fail 约定）。CI 目前只汇编并运行一个程序；官方套件需要 runner 与目标平台定义，且 Spike 作为外部参考仍未引入。
+- [ ] 补齐 `rv32mi-p-breakpoint` 所需的调试触发模块（`tcontrol`/`tselect`/`tdata1-3`）。当前 runner 将其列为 excluded：该测试的处理程序在 `tselect` 写入陷阱时直接跳向 `fail`，因此没有触发模块的实现无法通过它。
+- [ ] 补齐 `rv32mi-p-pmpaddr` 所需的物理内存保护（`pmpcfg0`/`pmpaddr0-15`）。模型目前完全没有 PMP。两者同样列为 excluded 而非通过。
 - [ ] 实现中断交付：`mip`/`mie` 当前无法置起任何中断，也没有 CLINT/PLIC 或内存映射的 `mtime`。
 - [ ] 增加 S/U 特权级：`mstatus.MPP` 不再硬连线为 M，`sret`/`sfence.vma` 成为合法编码，`ecall` 报告其来源模式。
-- [ ] 为内存模型加入解码后的地址映射与访问故障（`LoadAccessFault`/`StoreAccessFault`）。当前是逐字节稀疏映射、任意地址皆有后备：对算术验证是正确的，但无法建模未映射区域，且对全量套件偏慢。
 - [ ] 定义稳定的每指令 trace 格式（`PC`、指令、寄存器/CSR 变化、内存写入）以供差分测试使用。这是 ROADMAP P3 的前置条件：格式应先于 RTL 冻结，否则 RTL 侧会被迫适配未定的格式。
-- [ ] 引入 Spike 作为外部黄金参考，支撑上述差分测试。
+- [ ] 引入外部参考以支撑差分测试。注意 **`spike` 不在 Ubuntu apt 源中**，`qemu-system-misc`（8.2.2）可用作替代；Spike 需从源码构建（依赖 autoconf/gmp/mpc/dtc，构建耗时较长）。
 
 ## 之后
 
@@ -40,8 +45,10 @@ Rust 黄金参考模型及其未来 RTL 对应实现的工作台账。条目按�
 
 ## 本地环境说明
 
-以下为本开发环境的实际情况，`scripts/riscv-smoke.sh` 的行为与之相关：
+以下为本开发环境的实际情况：
 
 - `cargo`/`rustc`（1.97.1）**已在 `PATH` 上**（`~/.cargo/bin`）。若在其他环境缺失，添加 `export PATH="$HOME/.cargo/bin:$PATH"`。
-- **未安装** RISC-V 交叉工具链、Spike、QEMU、Verilator、yosys。因此 `scripts/riscv-smoke.sh` 在本地会自行跳过并以 0 退出；传 `--require` 则失败——CI 用的是 `--require`，以保证工具链缺失不会被静默放过。
-- 45 个 Rust 测试不依赖上述任何外部工具，`cargo test --all-targets` 即可全部运行。但它们使用手工编码的指令字，**不**覆盖编译器产生的真实编码——那部分只有 `riscv-smoke` 能验证。
+- RISC-V 交叉工具链（`riscv64-unknown-elf-gcc` 13.2.0）已安装，`scripts/riscv-smoke.sh --require` 与 `scripts/riscv-tests.sh --require` 均可在本地完整跑通。
+- **未安装** Spike、QEMU、Verilator、yosys。`spike` 不在 Ubuntu apt 源中，需从源码构建。
+- 75 个 Rust 测试不依赖任何外部工具，`cargo test --all-targets` 即可全部运行。但它们使用手工编码的指令字，**不**覆盖编译器产生的真实编码——那部分由 `riscv-smoke` 与 `riscv-tests` 验证。
+- `scripts/riscv-tests.sh` 默认克隆到临时目录并在结束时删除。用 `RISCV_TESTS_DIR=/path` 复用已有克隆/构建树时，该目录**永远不会被脚本删除**（这是刻意的：一个脚本不应删除调用者指定的目录）。

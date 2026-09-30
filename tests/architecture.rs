@@ -1,7 +1,10 @@
 //! Architectural traps, counters, and reserved-encoding checks.
 
-use chips::cpu::{Cpu, StepOutcome, Trap};
+mod common;
+
+use chips::cpu::{Cpu, StepOutcome, StopReason, Trap};
 use chips::Memory;
+use common::*;
 
 fn cpu_with_instruction(base: u32, instruction: u32) -> (Cpu, Memory) {
     let mut mem = Memory::permissive();
@@ -52,29 +55,51 @@ fn taken_control_flow_requires_four_byte_alignment() {
 }
 
 #[test]
-fn loads_and_stores_enforce_natural_alignment() {
-    let base = 0x3000;
+fn misaligned_data_accesses_complete_rather_than_trap() {
+    // The base ISA leaves misaligned data accesses implementation-defined
+    // ("may be supported"). This model completes them, matching Spike, QEMU, and
+    // real hardware, because that is what a differential test against them will
+    // expect and what `riscv-tests`' `ma_data` requires.
+    //
+    // Instruction fetch is a different matter: IALIGN = 32 makes a four-byte
+    // target architecturally mandatory, which the other tests here cover.
+    let code = 0x3000;
+    let data = 0x4000;
 
-    let (mut load_cpu, mut load_mem) = cpu_with_instruction(base, 0x0010_0093); // addi x1, x0, 1
-    load_mem.poke_u32(base + 4, 0x0000_a103); // lw x2, 0(x1)
-    assert_eq!(load_cpu.step(&mut load_mem), Ok(StepOutcome::Continue));
+    // A misaligned `lw` splices the four bytes across the boundary.
+    let [hi, lo] = li32(1, data);
+    let (mut cpu, mut mem) = machine(code, &[hi, lo, load(1, 1, 0b010, 2)]); // lw x2, 1(x1)
+    mem.poke_u32(data + 1, 0xAABB_CCDD);
+    for _ in 0..3 {
+        assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::Continue));
+    }
     assert_eq!(
-        load_cpu.step(&mut load_mem),
-        Err(Trap::LoadAddressMisaligned(1))
+        cpu.reg(2),
+        0xAABB_CCDD,
+        "a misaligned lw reads its four bytes little-endian"
     );
-    assert_eq!(load_cpu.reg(2), 0);
 
-    let (mut store_cpu, mut store_mem) = cpu_with_instruction(base, 0x0010_0093); // addi x1, x0, 1
-    store_mem.poke_u32(base + 4, 0x0020_9023); // sh x2, 0(x1)
-    store_mem.poke_u8(1, 0xaa);
-    store_mem.poke_u8(2, 0xbb);
-    assert_eq!(store_cpu.step(&mut store_mem), Ok(StepOutcome::Continue));
-    assert_eq!(
-        store_cpu.step(&mut store_mem),
-        Err(Trap::StoreAddressMisaligned(1))
+    // A misaligned `sh` writes only the two bytes it covers.
+    let [hi, lo] = li32(1, data);
+    let (mut cpu, mut mem) = machine(
+        code,
+        &[
+            hi,
+            lo,
+            li(2, 0x5A),
+            store(1, 2, 1, 0b001), // sh x2, 1(x1)
+            ebreak(),
+        ],
     );
-    assert_eq!(store_mem.peek_u8(1), 0xaa, "a trapping store has no effect");
-    assert_eq!(store_mem.peek_u8(2), 0xbb, "a trapping store has no effect");
+    mem.poke_u32(data + 8, 0xFFFF_FFFF);
+    assert_eq!(cpu.run(&mut mem, 10), Ok(StopReason::Ebreak));
+    assert_eq!(mem.peek_u8(data + 1), 0x5A);
+    assert_eq!(mem.peek_u8(data + 2), 0x00, "the high half of the halfword");
+    assert_eq!(
+        mem.peek_u32(data + 8),
+        0xFFFF_FFFF,
+        "a misaligned store must not touch bytes past its width"
+    );
 }
 
 #[test]
@@ -94,6 +119,62 @@ fn cycle_and_instret_counters_track_execution() {
     assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::Ebreak));
     assert_eq!(cpu.cycle(), 3);
     assert_eq!(cpu.instret(), 2, "ebreak does not retire");
+}
+
+#[test]
+fn writing_minstret_suppresses_that_instructions_own_increment() {
+    // The rule `riscv-tests`' instret_overflow checks: an instruction that writes
+    // minstret is not counted against the counter it just set, so the next
+    // reader sees the value written rather than one more than that. The same
+    // applies to the high half.
+    let base = 0x7000;
+
+    // `csrwi minstret, 0` then read it back: must read 0, not 1.
+    let (mut cpu, mut mem) = machine(
+        base,
+        &[
+            csr(0b101, 0xB02, 0, 0), // csrrwi x0, minstret, 0
+            csrrs(0xC02, 0, 5),      // csrrs x5, instret, x0
+            ebreak(),
+        ],
+    );
+    for _ in 0..2 {
+        assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::Continue));
+    }
+    assert_eq!(
+        cpu.reg(5),
+        0,
+        "the read saw the value written, not one more"
+    );
+    assert_eq!(
+        cpu.instret(),
+        1,
+        "only the writing instruction was suppressed; the reader retired"
+    );
+
+    // A write to the high half suppresses too, so the counter can be driven to
+    // its maximum and wrap cleanly.
+    let [hi, lo] = li32(6, 0xFFFF_FFFF);
+    let (mut cpu, mut mem) = machine(
+        base,
+        &[
+            hi,
+            lo,                 // x6 = 0xffffffff
+            csrrw(0xB02, 6, 0), // minstret = 0xffffffff (suppressed)
+            csrrw(0xB82, 6, 0), // minstreth = 0xffffffff (suppressed)
+            addi(0, 0, 0),      // nop: this one does retire
+            csrrs(0xC02, 0, 7), // read instret
+            ebreak(),
+        ],
+    );
+    for _ in 0..6 {
+        assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::Continue));
+    }
+    assert_eq!(
+        cpu.reg(7),
+        0,
+        "0xffffffff_ffffffff plus one nop wraps to zero"
+    );
 }
 
 #[test]
