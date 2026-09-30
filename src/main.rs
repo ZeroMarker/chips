@@ -13,6 +13,9 @@
 //!   `=tohost` value is the address of that register, which `riscv-tests` places
 //!   at a page boundary chosen by the linker and so varies per test; read it
 //!   from the image's symbol table.
+//! - `--trace`: write a per-instruction trace to stdout and nothing else, in the
+//!   format `docs/ARCHITECTURE.md` specifies. Intended for differential testing,
+//!   so the state dump is suppressed rather than interleaved.
 //!
 //! A program halts itself with `ecall`/`ebreak` when no trap handler is
 //! installed; a trap is reported with its `mcause`/`mtval` and a nonzero exit
@@ -24,13 +27,14 @@ use chips::htif::Outcome;
 use chips::isa::reg_name;
 use chips::mem::Memory;
 use chips::platform;
+use chips::trace::TextTrace;
 use std::process::ExitCode;
 
 const DEFAULT_START: u32 = 0x8000_0000;
 const DEFAULT_BUDGET: u64 = 10_000_000;
 
-const USAGE: &str =
-    "usage: chips <image.bin> [start_addr] [max_instructions] [--htif[=tohost_addr]]";
+const USAGE: &str = "usage: chips <image.bin> [start_addr] [max_instructions] \
+                   [--htif[=tohost_addr]] [--trace]";
 
 fn parse_u32(s: &str) -> Result<u32, String> {
     let clean = s.trim_start_matches("0x").trim_start_matches("0X");
@@ -65,8 +69,13 @@ fn main() -> ExitCode {
     // the flag does not shift them.
     let mut tohost = platform::riscv_tests::TOHOST;
     let mut htif_mode = false;
+    let mut trace = false;
     let mut positional: Vec<&String> = Vec::new();
     for arg in &args[1..] {
+        if arg == "--trace" {
+            trace = true;
+            continue;
+        }
         if let Some(value) = arg.strip_prefix("--htif=") {
             match parse_u32(value) {
                 Ok(v) => tohost = v,
@@ -135,6 +144,18 @@ fn main() -> ExitCode {
 
     let mut cpu = Cpu::new();
     cpu.set_pc(base);
+    if trace {
+        // The per-instruction trace goes to stdout, which mixes it with the state
+        // dump. A harness that wants to diff two runs wants the trace alone, so
+        // `--trace` suppresses the dump and the trace is the whole output.
+        cpu.set_trace(Some(Box::new(TextTrace::new(std::io::stdout()))));
+        let reason = cpu.run(&mut mem, budget);
+        eprintln!("stopped: {reason:?}");
+        return match reason {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::from(1),
+        };
+    }
 
     match cpu.run(&mut mem, budget) {
         Ok(reason) => {

@@ -30,6 +30,7 @@ use crate::csr::{
 };
 use crate::isa::{self, Decoded, Privilege};
 use crate::mem::Memory;
+use crate::trace::{Change, Record, StepResult, Trace};
 
 /// Outcome of executing a single instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +163,15 @@ pub struct Cpu {
     /// only way down is `mret` returning to whatever `MPP` holds; the only way up
     /// is a trap.
     privilege: Privilege,
+    /// Where to send a per-instruction trace, if anywhere.
+    trace: Option<Box<dyn Trace>>,
+    /// Changes made by the step in progress, drained into a [`Record`] when the
+    /// step ends. Collecting them here rather than diffing snapshots afterwards
+    /// means a register written with the value it already held still shows up,
+    /// which is what a hardware comparison needs.
+    changes: Vec<Change>,
+    /// How many steps have been started. Used as the trace's step number.
+    step_count: u64,
 }
 
 impl Default for Cpu {
@@ -184,6 +194,9 @@ impl Cpu {
             instret_written: false,
             mip: 0,
             privilege: Privilege::Machine,
+            trace: None,
+            changes: Vec::new(),
+            step_count: 0,
         }
     }
 
@@ -242,6 +255,19 @@ impl Cpu {
         self.privilege
     }
 
+    /// Send a per-instruction trace to `sink`, or stop tracing with `None`.
+    ///
+    /// Tracing costs a `Vec` push per state change, so it is off by default: a
+    /// run that nobody is comparing against should not pay for it.
+    pub fn set_trace(&mut self, sink: Option<Box<dyn Trace>>) {
+        self.trace = sink;
+    }
+
+    /// Is a trace attached?
+    pub fn is_tracing(&self) -> bool {
+        self.trace.is_some()
+    }
+
     /// Run at `privilege` from the current PC.
     ///
     /// This is how a test or a bootloader enters a lower mode directly, and how
@@ -261,7 +287,12 @@ impl Cpu {
     #[inline]
     fn write_rd(&mut self, rd: u32, val: u32) {
         if rd != 0 {
-            self.x[(rd as usize) & (isa::NUM_REGS - 1)] = val;
+            let index = (rd as usize) & (isa::NUM_REGS - 1);
+            self.x[index] = val;
+            self.changes.push(Change::Register {
+                index: rd & (isa::NUM_REGS as u32 - 1),
+                value: val,
+            });
         }
     }
 
@@ -279,10 +310,18 @@ impl Cpu {
     }
 
     /// Fetch, decode, and execute a single instruction.
+    ///
+    /// Every exit path produces exactly one trace record. The steps that can
+    /// fail before the instruction is even fetched — a misaligned or unmapped
+    /// fetch, or an interrupt — are reported with the instruction word they did
+    /// not get, because "the hardware jumped somewhere else" is only diagnosable
+    /// if the trace says where it expected to be.
     pub fn step(&mut self, mem: &mut Memory) -> Result<StepOutcome, Trap> {
         let pc = self.pc;
         self.cycle = self.cycle.wrapping_add(1);
         self.instret_written = false;
+        self.changes.clear();
+        self.step_count += 1;
 
         // Refresh the values the interrupt controller owns before anything can
         // observe them, and let it advance the time base. With no CLINT in the
@@ -298,27 +337,90 @@ impl Cpu {
         // An enabled, pending interrupt is taken before the next instruction
         // starts, so `mepc` points at the instruction that did not run.
         if let Some(cause) = self.pending_interrupt() {
-            return self.handle_interrupt(cause);
+            let result = self.handle_interrupt(cause);
+            return self.finish_step(result, pc, 0);
         }
 
         if pc & 0b11 != 0 {
-            return self.handle_trap(Trap::InstructionAddressMisaligned(pc));
+            let result = self.handle_trap(Trap::InstructionAddressMisaligned(pc));
+            return self.finish_step(result, pc, 0);
         }
 
-        let raw = mem
-            .fetch_u32(pc)
-            .map_err(|fault| Trap::InstructionAccessFault(fault.addr))?;
-        let inst = isa::decode(raw);
-        let outcome = match self.execute(inst, mem) {
-            Ok(outcome) => outcome,
-            Err(trap) => return self.handle_trap(trap),
+        let raw = match mem.fetch_u32(pc) {
+            Ok(raw) => raw,
+            Err(fault) => {
+                let result = self.handle_trap(Trap::InstructionAccessFault(fault.addr));
+                return self.finish_step(result, pc, 0);
+            }
         };
-        // An instruction that wrote `minstret` does not count itself: the value
-        // it wrote is what the next reader must see, not one more than that.
-        if outcome == StepOutcome::Continue && !self.instret_written {
-            self.instret = self.instret.wrapping_add(1);
+        let inst = isa::decode(raw);
+        // Sequenced rather than nested: `handle_trap` needs `&mut self` and
+        // `execute` borrows it, so the two cannot overlap.
+        let executed = self.execute(inst, mem);
+        let outcome = match executed {
+            Ok(outcome) => {
+                // An instruction that wrote `minstret` does not count itself:
+                // the value it wrote is what the next reader must see, not one
+                // more than that.
+                if outcome == StepOutcome::Continue && !self.instret_written {
+                    self.instret = self.instret.wrapping_add(1);
+                }
+                Ok(outcome)
+            }
+            // An exception is delivered, not returned: the point of the handler
+            // is that a bare-metal program can react to it. A trap with nowhere
+            // to go still comes back as Err, and `finish_step` records it before
+            // the caller sees it.
+            Err(trap) => self.handle_trap(trap),
+        };
+        self.finish_step(outcome, pc, raw)
+    }
+
+    /// Emit the trace record for the step that just ended and return the
+    /// instruction's own result unchanged.
+    fn finish_step(
+        &mut self,
+        outcome: Result<StepOutcome, Trap>,
+        pc: u32,
+        instruction: u32,
+    ) -> Result<StepOutcome, Trap> {
+        if self.trace.is_none() {
+            // Skip building the record entirely when nobody is watching, so an
+            // untraced run pays nothing for the change vector.
+            self.changes.clear();
+            return outcome;
         }
-        Ok(outcome)
+
+        let step = self.step_count;
+        let result = match &outcome {
+            Ok(StepOutcome::Continue) => StepResult::Retired,
+            // A taken trap is not a retirement, but the run continues.
+            Ok(StepOutcome::TrapTaken) => StepResult::Trap {
+                cause: self.csr.read(csr_addr::MCAUSE),
+                tval: self.csr.read(csr_addr::MTVAL),
+            },
+            // ecall/ebreak with no handler: the run stops here.
+            Ok(_) => StepResult::Halt,
+            // A trap that had nowhere to go is reported to the caller. It never
+            // reached a handler, so there are no trap CSRs to report; the cause
+            // the caller already has is the only useful thing.
+            Err(trap) => StepResult::Trap {
+                cause: trap.mcause(),
+                tval: trap.mtval(),
+            },
+        };
+
+        let record = Record {
+            step,
+            pc,
+            instruction,
+            outcome: result,
+            changes: std::mem::take(&mut self.changes),
+        };
+        if let Some(sink) = self.trace.as_mut() {
+            sink.record(&record);
+        }
+        outcome
     }
 
     /// The cause of the interrupt that should be taken now, if any.
@@ -344,9 +446,7 @@ impl Cpu {
     /// an interrupt has no faulting address. In vectored mode the entry point is
     /// `mtvec` base + 4 * cause, which is the one case where vectoring applies.
     fn handle_interrupt(&mut self, cause: u32) -> Result<StepOutcome, Trap> {
-        self.csr.write(csr_addr::MEPC, self.pc);
-        self.csr.write(csr_addr::MCAUSE, cause);
-        self.csr.write(csr_addr::MTVAL, 0);
+        self.write_trap_csrs(self.pc, cause, 0);
         self.enter_machine_mode();
 
         let mtvec = self.csr.read(csr_addr::MTVEC);
@@ -374,14 +474,32 @@ impl Cpu {
             };
         }
 
-        self.csr.write(csr_addr::MEPC, self.pc);
-        self.csr.write(csr_addr::MCAUSE, trap.mcause());
-        self.csr.write(csr_addr::MTVAL, trap.mtval());
+        self.write_trap_csrs(self.pc, trap.mcause(), trap.mtval());
         self.enter_machine_mode();
 
         // A synchronous exception enters at BASE even in vectored mode.
         self.pc = self.csr.read(csr_addr::MTVEC) & !0b11;
         Ok(StepOutcome::TrapTaken)
+    }
+
+    /// Write `mepc`/`mcause`/`mtval` and record them.
+    ///
+    /// Trap entry writes the CSR file directly rather than going through the
+    /// Zicsr path, so the change vector has to be told about it here — otherwise
+    /// a trace would show a trap that apparently changed nothing, and a
+    /// differential run could not tell where the handler was sent.
+    fn write_trap_csrs(&mut self, epc: u32, cause: u32, tval: u32) {
+        for (address, value) in [
+            (csr_addr::MEPC, epc & !0b11),
+            (csr_addr::MCAUSE, cause),
+            (csr_addr::MTVAL, tval),
+        ] {
+            self.csr.write(address, value);
+            self.changes.push(Change::Csr {
+                address,
+                value: self.csr.read(address),
+            });
+        }
     }
 
     /// The state change on entering machine mode: record where the trap came
@@ -402,6 +520,10 @@ impl Cpu {
         // down instead of trapping in a loop.
         next |= self.privilege.encoding() << MSTATUS_MPP_SHIFT;
         self.csr.write(csr_addr::MSTATUS, next);
+        self.changes.push(Change::Csr {
+            address: csr_addr::MSTATUS,
+            value: self.csr.read(csr_addr::MSTATUS),
+        });
         self.privilege = Privilege::Machine;
     }
 
@@ -494,12 +616,20 @@ impl Cpu {
                 let store = |m: &mut Memory, a: u32, n: u32, v: u64| -> Result<(), Trap> {
                     m.store(a, n, v).map_err(|f| Trap::StoreAccessFault(f.addr))
                 };
-                match funct3 {
-                    isa::funct3::SB => store(mem, addr, 1, val as u64)?,
-                    isa::funct3::SH => store(mem, addr, 2, val as u64)?,
-                    isa::funct3::SW => store(mem, addr, 4, val as u64)?,
+                let width = match funct3 {
+                    isa::funct3::SB => 1,
+                    isa::funct3::SH => 2,
+                    isa::funct3::SW => 4,
                     _ => return Err(Trap::IllegalInstruction(raw)),
-                }
+                };
+                store(mem, addr, width, val as u64)?;
+                // Recorded only after the store succeeded, so a faulting store
+                // never appears in a trace as though it had written.
+                self.changes.push(Change::Memory {
+                    address: addr,
+                    len: width,
+                    value: u64::from(val),
+                });
                 self.pc = pc.wrapping_add(4);
                 Ok(StepOutcome::Continue)
             }
@@ -778,7 +908,20 @@ impl Cpu {
                 self.instret = (self.instret & 0xFFFF_FFFF) | ((value as u64) << 32);
                 self.instret_written = true;
             }
-            _ => self.csr.write(address, value),
+            _ => {
+                self.csr.write(address, value);
+            }
+        }
+        // Recorded after the write so the value is what the register actually
+        // holds, i.e. after WARL legalization.
+        if !matches!(
+            address,
+            csr_addr::MCYCLE | csr_addr::MCYCLEH | csr_addr::MINSTRET | csr_addr::MINSTRETH
+        ) {
+            self.changes.push(Change::Csr {
+                address,
+                value: self.csr.read(address),
+            });
         }
     }
 }
