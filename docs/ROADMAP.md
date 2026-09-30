@@ -50,7 +50,7 @@
 - 确认本仓库的 `Cargo` 骨架与模块划分：`src/{isa,cpu,csr,mem,lib,main}.rs` 与 `tests/`（`isa`/`csr`/`mem` 为无状态依赖，`cpu` 为唯一有状态的执行核心）。
 - 用 `riscv64-unknown-elf-gcc` + `objcopy` 从裸机工程抽取裸二进制镜像，作为模型与 RTL 的共同输入格式。
 
-**验收**：`cargo build` 通过；能跑一条最小程序。**当前状态**：**已达成**。`cargo build` 通过，`scripts/riscv-smoke.sh`（汇编 `scripts/smoke.S` → 抽 `.text` → 模型运行 → 校验寄存器）在本地与 CI 均通过；`scripts/riscv-tests.sh` 进一步运行官方 `rv32ui-p-*`/`rv32mi-p-*` 套件。「调用 Spike/QEMU」一项**未达成**：Spike 与 QEMU 均未引入（`spike` 不在 apt 源中），本仓库改用自有 CLI 驱动作为运行入口。
+**验收**：`cargo build` 通过；能跑一条最小程序。**当前状态**：**已达成**。`cargo build` 通过，`scripts/riscv-smoke.sh`（汇编 `scripts/smoke.S` → 抽 `.text` → 模型运行 → 校验寄存器）在本地与 CI 均通过；`scripts/riscv-tests.sh` 进一步运行官方 `rv32ui-p-*`/`rv32mi-p-*` 套件。「调用 Spike/QEMU」一项**已达成**：Spike 已从源码构建（不在 apt 源中），`scripts/difftest.sh` 用它做逐步差分比较。
 
 ---
 
@@ -71,7 +71,7 @@
 
 **验收**：`rv32ui-p-*`、`rv32mi-p-*` 全绿；随机指令流下与 Spike 结果一致。
 
-**当前状态**：模型侧已完成 `RV32IMZicsr`（`src/isa.rs` 译码、`src/cpu.rs` 执行、`src/csr.rs` CSR 语义、`src/mem.rs` 解码地址映射），M 级陷阱进入与 `mret`，75 个 Rust 测试。**`rv32ui-p-*` 42/42 通过；`rv32mi-p-*` 14/16 通过**，2 个（`breakpoint` 需调试触发模块、`pmpaddr` 需 PMP）因设施未实现而排除，见 `scripts/riscv-tests.sh`。**Spike 差分尚未开始。** 官方套件还暴露并已修正两处语义缺陷（`minstret` 写入抑制、非对齐数据访问完成而非陷阱），说明它比手写测试更容易发现偏差。详见 [`ARCHITECTURE.md`](ARCHITECTURE.md) 与 [`TODO.md`](TODO.md)。
+**当前状态**：模型侧已完成 `RV32IMZicsr`（`src/isa.rs` 译码、`src/cpu.rs` 执行、`src/csr.rs` CSR 语义、`src/mem.rs` 解码地址映射）、M/S/U 三级特权与陷阱进入、中断交付与 CLINT、139 个 Rust 测试。**`rv32ui-p-*` 42/42 通过；`rv32mi-p-*` 13/16 通过**，3 个因设施未实现而排除（`breakpoint` 需调试触发模块、`pmpaddr` 需 PMP、`illegal` 需陷阱委派与 `TVM`/`TSR`/`SUM`/`MXR`），理由写在 `scripts/riscv-tests.sh`。官方套件前后暴露并修正四处语义缺陷（`minstret` 写入抑制、非对齐数据访问完成而非陷阱、`csr[9:8]` 特权表方向、以及陷阱入口把 `MPP` 掩码当成值写入），说明它比手写测试更容易发现偏差。**Spike 差分已建立并通过**：`scripts/difftest.sh` 对 `scripts/difftest.S` 的 225 步程序逐步比较 PC、指令字、目的寄存器值与内存写入，两侧完全一致。详见 [`ARCHITECTURE.md`](ARCHITECTURE.md) 与 [`TODO.md`](TODO.md)。
 
 ---
 
@@ -108,7 +108,11 @@
 
 **验收**：随机生成的数千指令流下，两轨道状态 100% 一致；至少一处真实缺陷（如对不齐、符号扩展）被差分测试捕获。
 
-**当前状态**：未开始（RTL 尚不存在）。但**前置条件已可提前准备**：差分测试需要模型输出稳定的每指令 trace（`PC`、指令、寄存器/CSR 变化、内存写入），该 trace 格式应先于 RTL 就位确定，否则 RTL 侧会被迫适配未冻结的格式。此项已列入 [`TODO.md`](TODO.md) 的 Next。
+**当前状态**：未开始（RTL 尚不存在），但**两侧的前置条件均已就位**。
+
+模型侧的每指令 trace 格式已冻结（`src/trace.rs`）：每步一行，`i`/`t`/`x` 三种记录，语法在代码中显式规定并由 `tests/trace.rs` 逐字锁定——格式先于 RTL 确定，否则 RTL 侧会被迫适配未冻结的格式。刻意不含周期数（模型一步一条、RTL 不是）与内存读（读不改状态，未命中已表现为取访问故障）。
+
+模型 vs Spike 的差分已跑通（`scripts/difftest.sh`）：逐步比较 PC、指令字、目的寄存器与其值、内存写入的地址与值，只比较**已退休**的指令，因为 Spike 提交日志仅记录这些。当前比较范围的两处已知收缩记录在 [`TODO.md`](TODO.md) 的 Next：CSR 写入不在交集内，以及差分程序必须避开实现自定的行为（非对齐数据访问——Spike 陷阱而模型完成，两者都合规；以及 `misa`/计数器等取值由实现决定的寄存器）。
 
 ---
 
@@ -181,6 +185,7 @@
 |------|------|------|
 | ISA 配置/规范频繁变更 | 返工 | 锁定基线版本（如 unpriv/priv spec 冻结版本），记录 `misa` 组合 |
 | 交叉验证框架初期不稳定 | 误报/漏报 | 先用 `riscv-tests`+Spike 打底，再上随机差分；先定向后随机 |
+| 差分比较因实现自定行为而误报 | 假阳性淹没真阳性 | 把「架构未规定」的行为排除在差分程序之外，并交由官方套件断言期望值（非对齐数据访问即如此：Spike 陷阱、模型完成、两者都合规） |
 | RTL 时间难以收敛 | 进度 | 先单周期正确性，再流水线；扩展按优先级取舍 |
 | 浮点/原子细节复杂 | 缺陷多 | 以 Rust 模型为金标准逐条对照 IEEE/规范，定向 stress |
 | 验证投入大 | 成本 | 借助开源测试集与 CI 自动化，避免手写海量定向用例 |
@@ -196,7 +201,7 @@
 - [ ] SoC boot 真实 `no_std` 程序，与 QEMU 输出一致
 - [ ] CI 全量回归全绿
 
-> 追踪中。模型侧的等价性前提已大体就位：官方套件 56/58 通过（2 个因缺 PMP 与调试触发模块而排除）。但本清单衡量的是**双轨一致性的终点**，模型单方面通过套件不构成其中任何一条——第一条尤其需要 RTL 存在。
+> 追踪中。模型侧的等价性前提已就位：官方套件 55/58 通过（3 个因缺 PMP、调试触发模块与陷阱委派而排除），且与 Spike 在 225 步程序上逐步一致。但本清单衡量的是**双轨一致性的终点**，模型单方面通过套件不构成其中任何一条——第一条尤其需要 RTL 存在。
 
 ---
 
