@@ -362,7 +362,10 @@ impl Cpu {
                 // An instruction that wrote `minstret` does not count itself:
                 // the value it wrote is what the next reader must see, not one
                 // more than that.
-                if outcome == StepOutcome::Continue && !self.instret_written {
+                if outcome == StepOutcome::Continue
+                    && !self.instret_written
+                    && !self.instret_inhibited()
+                {
                     self.instret = self.instret.wrapping_add(1);
                 }
                 Ok(outcome)
@@ -421,6 +424,16 @@ impl Cpu {
             sink.record(&record);
         }
         outcome
+    }
+
+    /// Is the instruction counter inhibited by `mcountinhibit.IR`?
+    ///
+    /// The other inhibit bit, `CY`, applies to `cycle`; the model does not
+    /// implement it, because `cycle` here is a step counter rather than a clock
+    /// and gating it would make the two tools' counters incomparable for no
+    /// architectural gain.
+    fn instret_inhibited(&self) -> bool {
+        self.csr.read(csr_addr::MCOUNTINHIBIT) & (1 << 2) != 0
     }
 
     /// The cause of the interrupt that should be taken now, if any.

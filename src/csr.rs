@@ -54,6 +54,15 @@ pub mod addr {
     pub const STVAL: u32 = 0x143;
     pub const SATP: u32 = 0x180;
 
+    /// Non-maskable interrupt status. A hart with no NMI source reports zero and
+    /// ignores writes, which is a legal WARL outcome rather than a missing
+    /// register: `riscv-tests` probes it to find out whether NMI exists.
+    pub const MNSTATUS: u32 = 0x744;
+    /// Machine counter inhibit. Bit 1 inhibits `cycle`, bit 2 inhibits
+    /// `instret`. Unlike most of the optional registers this one has behaviour
+    /// the model can honour, so it is implemented rather than stubbed.
+    pub const MCOUNTINHIBIT: u32 = 0x320;
+
     // Machine information.
     pub const MVENDORID: u32 = 0xF11;
     pub const MARCHID: u32 = 0xF12;
@@ -110,6 +119,9 @@ const MSTATUS_WRITABLE: u32 =
 /// that could be enabled but never set would be a quiet lie in the CSR file.
 const INTERRUPT_MASK: u32 = (1 << 11) | (1 << 7) | (1 << 3);
 
+/// `mcountinhibit` implements CY (bit 1) and IR (bit 2). The rest are reserved.
+const MCOUNTINHIBIT_WRITABLE: u32 = (1 << 1) | (1 << 2);
+
 /// `mepc` and `sepc` hold an instruction address; with IALIGN = 32 the low two
 /// bits are always zero.
 const EPC_MASK: u32 = !0b11;
@@ -165,6 +177,8 @@ impl Csr {
                 | addr::MCAUSE
                 | addr::MTVAL
                 | addr::MIP
+                | addr::MNSTATUS
+                | addr::MCOUNTINHIBIT
                 | addr::MCYCLE
                 | addr::MINSTRET
                 | addr::MCYCLEH
@@ -210,10 +224,15 @@ impl Csr {
             // Fixed-value registers.
             addr::MISA => MISA_VALUE,
             addr::MIP => raw & INTERRUPT_MASK,
+            // No NMI source exists, so this is constantly zero however it is
+            // written. Reporting it as a register that exists but does nothing
+            // is what lets software feature-detect instead of trapping.
+            addr::MNSTATUS => 0,
             // The narrow views.
             addr::SSTATUS => raw & SSTATUS_MASK,
             addr::MIE => raw & INTERRUPT_MASK,
             addr::MSTATUS => legalize_mstatus(raw),
+            addr::MCOUNTINHIBIT => raw & MCOUNTINHIBIT_WRITABLE,
             addr::MTVEC | addr::STVEC => legalize_vector(raw),
             addr::MEPC | addr::SEPC => raw & EPC_MASK,
             addr::SATP => legalize_satp(raw),
@@ -235,6 +254,7 @@ impl Csr {
             // outcome rather than a fault.
             addr::MISA
             | addr::MIP
+            | addr::MNSTATUS
             | addr::MVENDORID
             | addr::MARCHID
             | addr::MIMPID

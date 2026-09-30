@@ -127,7 +127,7 @@ fn main() -> ExitCode {
     };
 
     if htif_mode {
-        return run_htif(&bytes, base, budget, tohost);
+        return run_htif(&bytes, base, budget, tohost, trace);
     }
 
     let mut mem = Memory::permissive();
@@ -144,18 +144,7 @@ fn main() -> ExitCode {
 
     let mut cpu = Cpu::new();
     cpu.set_pc(base);
-    if trace {
-        // The per-instruction trace goes to stdout, which mixes it with the state
-        // dump. A harness that wants to diff two runs wants the trace alone, so
-        // `--trace` suppresses the dump and the trace is the whole output.
-        cpu.set_trace(Some(Box::new(TextTrace::new(std::io::stdout()))));
-        let reason = cpu.run(&mut mem, budget);
-        eprintln!("stopped: {reason:?}");
-        return match reason {
-            Ok(_) => ExitCode::SUCCESS,
-            Err(_) => ExitCode::from(1),
-        };
-    }
+    attach_trace(&mut cpu, trace);
 
     match cpu.run(&mut mem, budget) {
         Ok(reason) => {
@@ -185,7 +174,14 @@ fn main() -> ExitCode {
 /// drives [`Cpu::step`] itself and checks the device after every instruction,
 /// which also means the run stops the instant the result lands rather than
 /// burning the remaining budget.
-fn run_htif(bytes: &[u8], base: u32, budget: u64, tohost: u32) -> ExitCode {
+/// Attach a stdout trace if `trace` was requested.
+fn attach_trace(cpu: &mut Cpu, trace: bool) {
+    if trace {
+        cpu.set_trace(Some(Box::new(TextTrace::new(std::io::stdout()))));
+    }
+}
+
+fn run_htif(bytes: &[u8], base: u32, budget: u64, tohost: u32, trace: bool) -> ExitCode {
     let (mut mem, htif, _clint) = platform::riscv_tests(tohost);
     if let Err(fault) = mem.load_image(base, bytes) {
         eprintln!(
@@ -200,6 +196,7 @@ fn run_htif(bytes: &[u8], base: u32, budget: u64, tohost: u32) -> ExitCode {
 
     let mut cpu = Cpu::new();
     cpu.set_pc(base);
+    attach_trace(&mut cpu, trace);
 
     for step in 1..=budget {
         let outcome = match cpu.step(&mut mem) {
