@@ -124,10 +124,8 @@ jobs:
 
       # This is the ROADMAP P0/P1 acceptance criterion: the official rv32ui and
       # rv32mi suites running on the model, reporting through the tohost
-      # convention. The breakpoint test is excluded rather than passed because
-      # the debug trigger module is not implemented. PMP and illegal-instruction
-      # tests run as required checks.
-      # The script names them and fails on anything else, so a real regression
-      # cannot hide behind them.
+      # convention. All 58 selected programs, including breakpoint, PMP and
+      # illegal-instruction tests, run without exclusions. Any failure makes
+      # this required check fail.
       - name: Build and run rv32ui-p-* and rv32mi-p-*
         run: bash scripts/riscv-tests.sh --require

@@ -68,6 +68,9 @@ pub enum Trap {
     /// `ebreak` was executed and a trap handler is installed. Payload: the PC of
     /// the `ebreak`.
     Breakpoint(u32),
+    /// A native address trigger fired before the operation. Payload: the matched
+    /// virtual address. Unlike an EBREAK sentinel, no handler means an error.
+    Trigger(u32),
     /// A load address does not meet the accessed value's alignment.
     ///
     /// This model does **not** raise this: it completes misaligned data accesses
@@ -103,7 +106,7 @@ impl Trap {
             Trap::InstructionAddressMisaligned(_) => 0,
             Trap::InstructionAccessFault(_) => 1,
             Trap::IllegalInstruction(_) | Trap::Unsupported(_) => 2,
-            Trap::Breakpoint(_) => 3,
+            Trap::Breakpoint(_) | Trap::Trigger(_) => 3,
             Trap::LoadAddressMisaligned(_) => 4,
             Trap::LoadAccessFault(_) => 5,
             Trap::StoreAddressMisaligned(_) => 6,
@@ -124,7 +127,8 @@ impl Trap {
             | Trap::LoadAccessFault(val)
             | Trap::StoreAddressMisaligned(val)
             | Trap::StoreAccessFault(val)
-            | Trap::Breakpoint(val) => *val,
+            | Trap::Breakpoint(val)
+            | Trap::Trigger(val) => *val,
             Trap::IllegalInstruction(encoding) => *encoding,
             // ECALL carries no address, and an unimplemented extension has no
             // encoding-specific value to report.
@@ -328,6 +332,10 @@ impl Cpu {
             return self.finish_step(result, pc, 0);
         }
 
+        if let Err(trap) = self.check_trigger(pc, 4, Access::Fetch) {
+            let result = self.handle_trap(trap);
+            return self.finish_step(result, pc, 0);
+        }
         if pc & 0b11 != 0 {
             let result = self.handle_trap(Trap::InstructionAddressMisaligned(pc));
             return self.finish_step(result, pc, 0);
@@ -547,6 +555,27 @@ impl Cpu {
         });
     }
 
+    /// Interrupt-enable gating prevents native triggers from re-entering their
+    /// own M/S handlers. MPRV affects memory protection, not trigger mode bits.
+    fn check_trigger(&self, addr: u32, len: u32, access: Access) -> Result<(), Trap> {
+        let status = self.csr.read(csr_addr::MSTATUS);
+        if (self.privilege == Privilege::Machine && status & MSTATUS_MIE == 0)
+            || (self.privilege == Privilege::Supervisor
+                && self.csr.read(csr_addr::MEDELEG) & (1 << 3) != 0
+                && status & MSTATUS_SIE == 0)
+        {
+            return Ok(());
+        }
+        match self
+            .csr
+            .triggers()
+            .matched(self.privilege, addr, len, access)
+        {
+            Some(address) => Err(Trap::Trigger(address)),
+            None => Ok(()),
+        }
+    }
+
     /// PMP precedes backing memory/device access. Instruction fetch always uses
     /// current privilege; MPRV substitutes MPP for explicit data operations.
     fn check_memory(&self, addr: u32, len: u32, access: Access) -> Result<(), Trap> {
@@ -636,6 +665,7 @@ impl Cpu {
             isa::opcode::LOAD => {
                 let addr = self.x(rs1).wrapping_add(imm as u32);
                 let load = |m: &Memory, a: u32, n: u32| -> Result<u64, Trap> {
+                    self.check_trigger(a, n, Access::Load)?;
                     self.check_memory(a, n, Access::Load)?;
                     m.load(a, n).map_err(|f| Trap::LoadAccessFault(f.addr))
                 };
@@ -656,6 +686,7 @@ impl Cpu {
                 let addr = self.x(rs1).wrapping_add(imm as u32);
                 let val = self.x(rs2);
                 let store = |m: &mut Memory, a: u32, n: u32, v: u64| -> Result<(), Trap> {
+                    self.check_trigger(a, n, Access::Store)?;
                     self.check_memory(a, n, Access::Store)?;
                     m.store(a, n, v).map_err(|f| Trap::StoreAccessFault(f.addr))
                 };

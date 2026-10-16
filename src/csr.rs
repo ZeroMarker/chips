@@ -33,6 +33,7 @@ use std::collections::BTreeMap;
 
 use crate::isa::Privilege;
 use crate::pmp::Pmp;
+use crate::triggers::Triggers;
 
 /// Standard CSR addresses (unprivileged, supervisor, and machine level).
 pub mod addr {
@@ -86,6 +87,12 @@ pub mod addr {
     pub const PMPCFG0: u32 = 0x3A0;
     /// First of sixteen PMP address CSRs (0x3B0..=0x3BF).
     pub const PMPADDR0: u32 = 0x3B0;
+    /// First native trigger CSR; offsets 0..=4 are tselect/tdata1-3/tinfo.
+    pub const TSELECT: u32 = 0x7A0;
+    pub const TDATA1: u32 = 0x7A1;
+    pub const TDATA2: u32 = 0x7A2;
+    pub const TDATA3: u32 = 0x7A3;
+    pub const TINFO: u32 = 0x7A4;
     // Machine counters (read/write).
     pub const MCYCLE: u32 = 0xB00;
     pub const MINSTRET: u32 = 0xB02;
@@ -147,6 +154,7 @@ const EPC_MASK: u32 = !0b11;
 pub struct Csr {
     data: BTreeMap<u32, u32>,
     pmp: Pmp,
+    triggers: Triggers,
 }
 
 impl Csr {
@@ -158,7 +166,8 @@ impl Csr {
     /// Does this model implement `csr`? Accessing any other address is an
     /// illegal instruction.
     pub fn exists(csr: u32) -> bool {
-        (addr::PMPCFG0..addr::PMPCFG0 + 4).contains(&csr)
+        (addr::TSELECT..=addr::TINFO).contains(&csr)
+            || (addr::PMPCFG0..addr::PMPCFG0 + 4).contains(&csr)
             || (addr::PMPADDR0..addr::PMPADDR0 + 16).contains(&csr)
             || matches!(
                 csr,
@@ -236,6 +245,9 @@ impl Csr {
     /// is reported as an illegal instruction rather than as a read of state that
     /// belongs to a more privileged mode.
     pub fn read(&self, csr: u32) -> u32 {
+        if (addr::TSELECT..=addr::TINFO).contains(&csr) {
+            return self.triggers.read(csr - addr::TSELECT);
+        }
         if (addr::PMPCFG0..addr::PMPCFG0 + 4).contains(&csr) {
             return self.pmp.read_config((csr - addr::PMPCFG0) as usize);
         }
@@ -273,6 +285,10 @@ impl Csr {
     /// alias can see, so a supervisor cannot disturb `mstatus.MIE` by writing
     /// `sstatus`.
     pub fn write(&mut self, csr: u32, val: u32) {
+        if (addr::TSELECT..=addr::TINFO).contains(&csr) {
+            self.triggers.write(csr - addr::TSELECT, val);
+            return;
+        }
         if (addr::PMPCFG0..addr::PMPCFG0 + 4).contains(&csr) {
             self.pmp.write_config((csr - addr::PMPCFG0) as usize, val);
             return;
@@ -322,6 +338,11 @@ impl Csr {
             _ => merged,
         };
         self.data.insert(slot, stored);
+    }
+
+    /// Native address trigger state for CPU access checks.
+    pub fn triggers(&self) -> &Triggers {
+        &self.triggers
     }
 
     /// Physical memory protection state for CPU access checks.

@@ -71,7 +71,7 @@
 
 **验收**：`rv32ui-p-*`、`rv32mi-p-*` 全绿；随机指令流下与 Spike 结果一致。
 
-**当前状态**：**大部分实现，尚未完成本阶段验收**（仍有 1 项排除，受限随机指令流差分尚未建立）。模型侧已完成 `RV32IMZicsr`（`src/isa.rs` 译码、`src/cpu.rs` 执行、`src/csr.rs` CSR 语义、`src/mem.rs` 解码地址映射）、M/S/U 三级特权、M/S 陷阱委派、中断交付、CLINT 与 16 项 PMP、162 个 Rust 测试。**`rv32ui-p-*` 42/42 通过；`rv32mi-p-*` 15/16 通过**，1 个因调试触发模块未实现而排除（`breakpoint`）；`illegal` 与 `pmpaddr` 已通过，理由写在 `scripts/riscv-tests.sh`。官方套件前后暴露并修正四处语义缺陷（`minstret` 写入抑制、非对齐数据访问完成而非陷阱、`csr[9:8]` 特权表方向、以及陷阱入口把 `MPP` 掩码当成值写入），说明它比手写测试更容易发现偏差。**Spike 差分已建立并通过**：`scripts/difftest.sh` 对 `scripts/difftest.S` 的 225 步程序逐步比较 PC、指令字、目的寄存器值与内存写入，两侧完全一致。详见 [`ARCHITECTURE.md`](ARCHITECTURE.md) 与 [`TODO.md`](TODO.md)。
+**当前状态**：**选定官方定向套件已全通过，随机差分验收仍待完成**。模型侧已完成 `RV32IMZicsr`（`src/isa.rs` 译码、`src/cpu.rs` 执行、`src/csr.rs` CSR 语义、`src/mem.rs` 解码地址映射）、M/S/U 三级特权、M/S 陷阱委派、中断交付、CLINT、16 项 PMP 与两个原生地址触发器、174 个 Rust 测试。**`rv32ui-p-*` 42/42 通过；`rv32mi-p-*` 16/16 通过**，0 排除、0 跳过。`breakpoint`、`illegal` 与 `pmpaddr` 均纳入门禁。官方套件前后暴露并修正四处语义缺陷（`minstret` 写入抑制、非对齐数据访问完成而非陷阱、`csr[9:8]` 特权表方向、以及陷阱入口把 `MPP` 掩码当成值写入），说明它比手写测试更容易发现偏差。**Spike 差分已建立并通过**：`scripts/difftest.sh` 对 `scripts/difftest.S` 的 225 步程序逐步比较 PC、指令字、目的寄存器值与内存写入，两侧完全一致。详见 [`ARCHITECTURE.md`](ARCHITECTURE.md) 与 [`TODO.md`](TODO.md)。
 
 ---
 
@@ -201,7 +201,7 @@
 - [ ] SoC boot 真实 `no_std` 程序，与 QEMU 输出一致
 - [ ] CI 全量回归全绿
 
-> 追踪中。模型侧的等价性前提已就位：官方套件 57/58 通过（1 个因缺调试触发模块而排除），且与 Spike 在 225 步通用程序和 103 步 PMP 程序上逐步一致。但本清单衡量的是**双轨一致性的终点**，模型单方面通过套件不构成其中任何一条——第一条尤其需要 RTL 存在。
+> 追踪中。模型侧的等价性前提已就位：官方套件 58/58 通过（0 排除、0 跳过），且与 Spike 在 225 步通用、103 步 PMP 和 105 步触发器程序上逐步一致。但本清单衡量的是**双轨一致性的终点**，模型单方面通过套件不构成其中任何一条——第一条尤其需要 RTL 存在。
 
 ---
 

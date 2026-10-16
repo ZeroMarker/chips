@@ -24,6 +24,7 @@ src/
   cpu.rs      CPU 状态与执行循环（取指 → 译码 → 执行 → 陷阱）
   csr.rs      CSR 容器：地址表、只读判定、WARL 字段语义
   pmp.rs      16 项物理内存保护：匹配、权限与锁定
+  triggers.rs 双原生地址触发器：寄存器与地址匹配
   mem.rs      解码后的地址映射：区域、权限、访问故障、设备
   htif.rs     HTIF `tohost`/`fromhost` 测试完成协议
   platform.rs 预定义目标平台（`riscv-tests` 内存布局）
@@ -59,10 +60,10 @@ main ──▶ cpu ──▶ isa
 1. `cycle` 加一（在取指之前，因此陷阱步骤也计数），清除 `instret_written` 标志，清空本步的变化向量
 2. 向地址空间索取设备置起的 `mip`（`& Csr::mip_mask()`）与时间基；并让它推进时间基。**没有 CLINT 的地址空间**退回模型自己的每步计数器，因此指令级测试读 `time` 不会看到 0
 3. **中断检查**：合并设备信号与软件注入的 pending 位，按委派、源使能、当前特权和目标级全局使能交付；发生在取指前，目标级 EPC 指向没有执行的指令
-4. **取指对齐检查**：`pc & 0b11 != 0` → `InstructionAddressMisaligned`
+4. **执行地址触发器检查**，命中即进入断点异常；未命中再做**取指对齐检查**：`pc & 0b11 != 0` → `InstructionAddressMisaligned`
 5. 先按当前特权检查 PMP，再 `mem.fetch_u32(pc)` 取指（4 字节小端）；拒绝时 `InstructionAccessFault`，不读取后备设备
 6. `isa::decode()` 译码
-7. `execute()`：按 `opcode` 分派，产出 `StepOutcome`；数据访存先检查 PMP（含 MPRV），再访问内存，失败产生对应的 `LoadAccessFault`/`StoreAccessFault`
+7. `execute()`：按 `opcode` 分派，产出 `StepOutcome`；数据访存先检查地址触发器，再检查 PMP（含 MPRV），最后访问内存，失败产生对应的 `LoadAccessFault`/`StoreAccessFault`
 8. 若正常退休且本指令**未写入** `minstret` 且 `mcountinhibit.IR` 未置位，`instret` 加一
 9. 若挂了 trace，构造一条 `Record` 并交给 sink
 
@@ -96,7 +97,7 @@ main ──▶ cpu ──▶ isa
 
 同步异常在当前特权为 S/U 且 `medeleg[cause] = 1` 时进入 S 级，否则进入 M 级；M 级异常始终留在 M。`medeleg` 可写原因 0–9，M 级 ECALL 位 11 与未支持原因读零。
 
-先选目标，再检查该目标的 `stvec`/`mtvec`。非零表示有同步异常处理程序；零值时 `ecall`/`ebreak` 结束运行，其他异常返回 `Err(Trap)`。委派目标未安装处理程序时不回退到 M 级。此停机约定属于模型驱动，不是硬件复位语义。
+先选目标，再检查该目标的 `stvec`/`mtvec`。非零表示有同步异常处理程序；零值时 `ecall`/`ebreak` 结束运行，其他异常（包括硬件 `Trigger`）返回 `Err(Trap)`。委派目标未安装处理程序时不回退到 M 级。此停机约定属于模型驱动，不是硬件复位语义。
 
 ### 进入序列
 
@@ -130,6 +131,7 @@ MRET 仅 M 可执行，返回 MPP 指定特权与 `mepc`；SRET 在 S/M 可执�
 | `InstructionAccessFault(a)` | 1 | 故障地址 |
 | `IllegalInstruction(enc)` | 2 | **故障编码本身** |
 | `Breakpoint(pc)` | 3 | `ebreak` 的 PC |
+| `Trigger(a)` | 3 | 命中的访问地址；执行地址触发前尚未取指，trace 指令字为 0 |
 | `LoadAddressMisaligned(a)` | 4 | 故障地址（本模型不产生，见上） |
 | `LoadAccessFault(a)` | 5 | 故障地址 |
 | `StoreAddressMisaligned(a)` | 6 | 故障地址（本模型不产生） |
@@ -218,6 +220,16 @@ CPU 在取指和每次 load/store 调用后备内存之前检查 PMP。MPRV=1 �
 
 `tests/pmp.rs` 覆盖权限、边界、锁定和 MPRV。官方 `pmpaddr` 在 G=0 时只走寄存器探测路径；额外 `scripts/pmp.S` 通过执行与故障处理检查隔离，103 步程序与 Spike 一致（只比较现有 harness 的退休记录交集）。
 
+### 原生地址触发器
+
+`Csr` 持有两个独立触发器。`tselect` 只选择配置窗口，不影响其他触发器是否激活；越界选择保持原值以便枚举结束。`tdata1` 固定 type=2，支持 M/S/U 与执行/读/写位；`tdata2` 保存完整 32 位地址；`tdata3` 固定零（无上下文过滤）；`tinfo` 为 `0x01000004`（version=1，type=2）。零写或未支持类型禁用触发器且保留地址。其余字段合法化为零，读回可发现仅支持等值地址、任意宽度、before timing、action=0。无 `mcontrol6`、外部 Debug Mode、dmode、hit 位、数据/链式匹配。
+
+使用 [Sdtrig v1.0](https://docs.riscv.org/reference/debug/v1.0/Sdtrig.html) 的 MIE/SIE 防重入方案：M 且 MIE=0 时抑制；S 且断点已委派、SIE=0 时抑制。U 不受这些门控限制，S 断点未委派时可向 M 陷阱。此方案保留 `medeleg[3]`，可选 `tcontrol` 不存在。MPRV 只影响内存保护，触发器模式位依据当前特权。
+
+执行地址在取指/PMP 前比较；数据地址在解码合法性确认后、PMP 与内存副作用前比较。每个访问字节都可匹配，最低触发器索引决定 tval；匹配不绕回零地址。命中产生 `Trap::Trigger`（原因 3），EPC 为未完成指令 PC，tval 为命中的字节地址，不退休、不写目的寄存器或内存。现有 M/S 陷阱入口和 xRET 自然关闭/恢复门控。未安装目标处理程序时返回错误，不复用 EBREAK 停机约定。
+
+`tests/triggers.rs` 的 12 个回归验证能力、优先级、权限和副作用；额外 `scripts/triggers.S` 的 105 步程序与 Spike 一致，覆盖执行/读/写、双触发器、处理程序内抑制与恢复。
+
 ## 8. 测试完成协议（HTIF）
 
 `riscv-tests` 不 halt。`RVTEST_PASS` 写 `1`，`RVTEST_FAIL` 写 `(check << 1) | 1`，然后自旋；遇到无法处理的异常则把 `1337` 或进测试号后**原样**写入（不走那个编码）。因此：
@@ -256,9 +268,9 @@ CPU 在取指和每次 load/store 调用后备内存之前检查 PMP。MPRV=1 �
 
 ### 官方套件
 
-上述不变量之外，`scripts/riscv-tests.sh` 跑官方 `rv32ui-p-*` 与 `rv32mi-p-*`，**57 通过、0 失败、1 excluded**。它比任何手写测试都更容易发现语义偏差——本项目中被它抓出的四处（`minstret` 抑制、非对齐数据访问、`csr[9:8]` 特权表方向、陷阱入口的 `MPP` 写入）都不是靠推理想到的。修改执行语义后应先跑它。
+上述不变量之外，`scripts/riscv-tests.sh` 跑官方 `rv32ui-p-*` 与 `rv32mi-p-*`，**58 通过、0 失败、0 excluded**。它比任何手写测试都更容易发现语义偏差——本项目中被它抓出的四处（`minstret` 抑制、非对齐数据访问、`csr[9:8]` 特权表方向、陷阱入口的 `MPP` 写入）都不是靠推理想到的。修改执行语义后应先跑它。
 
-被排除的一项写进 `scripts/riscv-tests.sh` 的注释并说明缺什么，而不是当作通过：这样表头的数字才有意义，被支持的测试里出回归也不会被淹没。
+`scripts/riscv-tests.sh` 已删除排除清单，当前选定的 58 个程序全部执行；任一失败都会令脚本以非零码退出。
 
 `scripts/difftest.sh` 是可选的第三重安全网：与 Spike 逐步比对 PC、指令字、目的寄存器值与内存写入。它**不属于门禁**——Spike 不在 apt 源中，当前 CI 未配置 Spike 的固定版本构建与缓存；缺 Spike 时它打印 `SKIP` 并以 0 退出，`--require` 可让缺失变成失败。
 
@@ -304,10 +316,10 @@ x <step> pc=<8 hex> inst=<8 hex> [...]
 
 按对验证工作的阻塞程度排列，与 [`TODO.md`](TODO.md) 的优先级一致：
 
-1. **无调试触发模块**。仅 `rv32mi-p-breakpoint` 仍为 excluded。`rv32mi-p-pmpaddr` 与 `rv32mi-p-illegal` 已通过并纳入门禁；PMP 基础功能已实现，Smepmp 增强未实现。
+1. **原生触发器仅实现基础地址匹配**。`breakpoint`、`pmpaddr`、`illegal` 已全部纳入门禁，但外部调试、type-6 与高级触发功能未实现；PMP 的 Smepmp 增强也未实现。
 2. **无地址转换**。仅 Bare，`satp`/TVM/SUM/MXR 读零；选择不实现 `SFENCE.VMA` 并产生非法指令异常。引入 Sv32 时需要配套页表遍历、权限和 TVM 门控。
 3. **无 PLIC**。平台目前只有 CLINT，尚无外部中断控制器；S 级外部/定时器中断可由 M 软件注入。
-4. **差分比较不含 CSR 写入与完整最终状态**。新委派路径由定向回归与官方 `illegal` 测试验证，现有 225 步通用探针与 103 步 PMP 探针仍不提供这部分完整差分覆盖。
+4. **差分比较不含 CSR 写入与完整最终状态**。新委派路径由定向回归与官方 `illegal` 测试验证，现有 225 步通用、103 步 PMP 与 105 步触发器探针仍不提供这部分完整差分覆盖。
 
 本次特权语义依据固定版本的官方手册：[Machine-Level ISA v1.13](https://docs.riscv.org/reference/isa/v20260120/priv/machine.html)（委派、中断、TSR、PMP 与 MPRV）及 [Supervisor-Level ISA v1.13](https://docs.riscv.org/reference/isa/v20260120/priv/supervisor.html)（CSR 视图、Bare 与 SFENCE.VMA）。
 

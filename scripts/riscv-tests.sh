@@ -143,25 +143,6 @@ fi
 
 echo "riscv-tests: running ${#targets[@]} binaries on the model"
 
-# Tests for facilities this model does not implement. They are reported
-# separately rather than counted as passes, so the headline number means what it
-# says and a regression in a supported test is never lost in the noise.
-#
-#   rv32mi-p-breakpoint  the debug trigger module (tcontrol/tselect/tdata1-3).
-#                       The test's own handler jumps straight to `fail` when a
-#                       `tselect` write traps, so an implementation without the
-#                       module cannot pass it. Debug spec, not base ISA.
-excluded_patterns=(
-  "rv32mi-p-breakpoint"
-)
-is_excluded() {
-  local name=$1 pattern
-  for pattern in "${excluded_patterns[@]}"; do
-    [ "$name" = "$pattern" ] && return 0
-  done
-  return 1
-}
-
 image=$(mktemp)
 (cd "$root" && "$cargo" build --quiet --bin chips)
 bin="$root/target/debug/chips"
@@ -170,18 +151,11 @@ pass=0
 fail=0
 excluded=0
 failed_names=()
-excluded_names=()
 skipped=0
 
 for elf in "${targets[@]}"; do
   name=$(basename "$elf")
   [ -x "$elf" ] || { skipped=$((skipped + 1)); continue; }
-
-  if is_excluded "$name"; then
-    excluded=$((excluded + 1))
-    excluded_names+=("$name")
-    continue
-  fi
 
   "$objcopy" -O binary "$elf" "$image" 2>/dev/null || {
     echo "  SKIP $name (objcopy failed)"
@@ -209,9 +183,6 @@ done
 rm -f "$image"
 
 echo "riscv-tests: $pass passed, $fail failed, $excluded excluded, $skipped skipped"
-if [ "$excluded" -ne 0 ]; then
-  echo "riscv-tests: excluded (unimplemented): ${excluded_names[*]}"
-fi
 
 if [ "$fail" -ne 0 ]; then
   echo "riscv-tests: failed: ${failed_names[*]}" >&2
