@@ -11,7 +11,7 @@
 
 模型是**可执行规范**，不是性能模拟器，也不追求 RTL 的时序结构。三个由此而来的定位：
 
-1. **正确性优先于速度**。一条指令的执行就是一条语句，没有流水线、没有多周期时序。代价是全量测试套件会很慢，这正是 TODO 中「给内存模型加地址映射」的原因。
+1. **正确性优先于速度**。一条指令的执行就是一条语句，没有流水线、没有多周期时序。当前内存模型已有地址映射与平坦 RAM 后备；执行按指令推进，不模拟流水线时序。
 2. **黄金参考**。RTL 差分测试（P3）以本模型为金标准，因此任何「为了跑通而放宽」的处理都是缺陷，不是权衡。
 3. **安全 Rust**。`Cargo.toml` 声明 `unsafe_code = "forbid"`，CI 将警告视为失败。所有内存访问都经过建模的地址空间，硬件工程师或评审者无需推理未定义行为。
 
@@ -57,7 +57,7 @@ main ──▶ cpu ──▶ isa
 
 1. `cycle` 加一（在取指之前，因此陷阱步骤也计数），清除 `instret_written` 标志，清空本步的变化向量
 2. 向地址空间索取设备置起的 `mip`（`& Csr::mip_mask()`）与时间基；并让它推进时间基。**没有 CLINT 的地址空间**退回模型自己的每步计数器，因此指令级测试读 `time` 不会看到 0
-3. **中断检查**：待处理、已使能且 `mstatus.MIE` 置位时在此交付，发生在任何指令开始之前，因此 `mepc` 指向没有执行的那一条
+3. **中断检查**：合并设备信号与软件注入的 pending 位，按委派、源使能、当前特权和目标级全局使能交付；发生在取指前，目标级 EPC 指向没有执行的指令
 4. **取指对齐检查**：`pc & 0b11 != 0` → `InstructionAddressMisaligned`
 5. `mem.fetch_u32(pc)` 取指（4 字节小端），失败则 `InstructionAccessFault`
 6. `isa::decode()` 译码
@@ -91,55 +91,33 @@ main ──▶ cpu ──▶ isa
 
 ## 4. 陷阱模型
 
-### 无处理程序 vs 有处理程序
+### 路由与无处理程序约定
 
-模型以 `mtvec != 0` 判定「处理程序已安装」。这个分岔是驱动裸机程序停机的机制：
+同步异常在当前特权为 S/U 且 `medeleg[cause] = 1` 时进入 S 级，否则进入 M 级；M 级异常始终留在 M。`medeleg` 可写原因 0–9，M 级 ECALL 位 11 与未支持原因读零。
 
-| 陷阱 | `mtvec == 0` | `mtvec != 0` |
-|------|-------------|--------------|
-| `ecall` / `ebreak` | 结束 `run` 循环（`StopReason::Ecall` / `Ebreak`） | 正常陷阱进入 |
-| 其他所有异常 | 作为 `Err(Trap)` 返回给调用方 | 正常陷阱进入 |
-
-未安装处理程序时，模型**没有架构上有意义的目标可跳转**，因此 `ecall`/`ebreak` 用来停机，其他异常上抛给调用方（CLI 转储状态并以退出码 1 退出）。
+先选目标，再检查该目标的 `stvec`/`mtvec`。非零表示有同步异常处理程序；零值时 `ecall`/`ebreak` 结束运行，其他异常返回 `Err(Trap)`。委派目标未安装处理程序时不回退到 M 级。此停机约定属于模型驱动，不是硬件复位语义。
 
 ### 进入序列
 
-`handle_trap()` 写入 `mepc`（故障 PC）、`mcause`、`mtval`，然后压栈中断使能位：
+M 级入口写 `mepc`/`mcause`/`mtval`，执行 `MPIE <- MIE`、`MIE <- 0`、`MPP <- 来源特权`；S 级入口写 `sepc`/`scause`/`stval`，执行 `SPIE <- SIE`、`SIE <- 0`、`SPP <- 来源特权`。S 级入口保留机器级陷阱寄存器、MPP、MPIE 与 MIE，因此可正确嵌套 M 级陷阱。
 
-```
-MPIE <- MIE
-MIE  <- 0
-MPP  =  陷阱来源的模式        (M/S/U)
-PC   <- mtvec & !0b11
-```
-
-`MPP` 记录**来源模式**而不是硬连线为 M。差别只在 S 与 U 上可见，但正是它让 `mret` 能退回低特权级而不是陷入死循环。
-
-**同步异常总是进入 `mtvec` 基址**，即使 `mtvec` 选择了 vectored 模式——vectored 只对中断有意义。
+同步异常进入目标 `tvec` 基址，向量模式也不加偏移。入口与返回的状态写入均进入 trace；S 级陷阱记录使用 `scause`/`stval`。
 
 ### 中断交付
 
-中断在**步骤边界**、下一条指令开始之前交付，因此 `mepc` 指向那条没有执行的指令：
+`mip` 的设备信号与软件 pending 位分开保存，读取时合并。CLINT 提供 MSIP/MTIP；M 可通过 CSR 写入 SSIP/STIP/SEIP。`mideleg` 仅支持位 1/5/9（SSI/STI/SEI），机器级源不可委派。
 
-```
-mepc   <- 当前 PC
-mcause <- 中断位本身（MSI = 3，MTI = 7，MEI = 11）
-mtval  <- 0                      (中断没有故障地址)
-PC     <- mtvec + 4 * mcause     (仅 vectored 模式)
-```
+- 目标 M：`mip & mie & ~mideleg` 中有 pending 位，且当前特权低于 M 或 MIE=1。
+- 目标 S：`mip & mie & mideleg` 中有 pending 位，且当前为 U，或当前为 S 且 SIE=1。M 级运行时屏蔽已委派中断。
+- 目标 M 优先于目标 S；同目标按 MEI > MSI > MTI > SEI > SSI > STI 排序。
 
-`mcause` 是位值而非原因码，这是中断与异常的分界。多个源同时就绪时取**位号最高**者（MEI > MTI > MSI），即平台的固定优先级。WFI 仍然立即退休：架构允许把它当作提示，而中断检查发生在下一步边界，所以待处理且已使能的中断仍会在紧随其后的指令之前被取走。
+RV32 `xcause = 0x80000000 | 原因号`，`xtval = 0`。直接模式进入 `tvec & !3`；向量模式进入 `(tvec & !3) + 4 * 原因号`，偏移不使用 pending 位掩码。EPC 保存尚未执行的指令地址。WFI 立即退休，下一步重新检查中断。
 
 ### `mret` / `sret`
 
-两者读不同的字段，因此共享一个实现：
+MRET 仅 M 可执行，返回 MPP 指定特权与 `mepc`；SRET 在 S/M 可执行，返回 SPP 指定特权与 `sepc`，TSR=1 时 S 级执行 SRET 陷阱，M 级不受此位限制。
 
-```
-mret:  MIE  <- MPIE ;  MPIE <- 1 ;  MPP = M  ;  PC <- mepc
-sret:  SIE  <- SPIE ;  SPIE <- 1 ;  SPP = S  ;  PC <- sepc
-```
-
-`MPP` 是两比特，可以是 M/S/U；`SPP` 只有一比特，只能是 U 或 S，**永远不是 M**——这正是 S 是 `sret` 可用的最高特权级的原因。`sret` 之后 `SPP` 被置为 S，因此它无法被用来爬升特权。
+两者均执行 `xIE <- xPIE`、`xPIE <- 1`，并将 `xPP` 清为最低支持特权 U。测试覆盖 U→S→M 的嵌套进入与 MRET→SRET 返回路径。
 
 ### `Trap` 枚举
 
@@ -178,13 +156,13 @@ CSR 的正确性集中在三件事，缺一不可。
 
 低于所需等级的访问是**非法指令**而非读到别人的状态。`Privilege` 的判别值就是架构编码（U = 0、S = 1、M = 3），且派生的序关系有意义（`U < S < M`），所以「至少同等特权」是一次 `<=` 比较而不是遍历一个集合。
 
-`sstatus` 与 `sie` 不是独立寄存器，而是 `mstatus` 与 `mie` 的**窄视图**，共享存储。经别名写入只更新该别名可见的字段，因此监管级无法通过写 `sstatus` 触及 `MIE`。
+`sstatus`、`sie`、`sip` 分别是 `mstatus`、`mie`、`mip` 的**窄视图**，共享存储。`sie`/`sip` 仅显示 `mideleg` 中已委派的位；S 可写这些使能位，但 pending 位只允许写 SSIP。经别名写入只更新该别名可见的字段，因此监管级无法通过写 `sstatus` 触及 `MIE`。
 
 ### 只读
 
 `Csr::is_read_only()` 按架构读取地址的 `csr[11:10] == 0b11`。写入只读 CSR **产生非法指令异常**（在 `cpu::execute_csr` 中判定），而 `Csr::write()` 内部则静默丢弃——两层防御，使得无论谁调用，存储都保持一致。
 
-`mvendorid`/`marchid`/`mimpid`/`mhartid`/`misa`/`mip` 属只读/常量，写入被忽略（这是合法的 WARL 结果）。
+`mvendorid`/`marchid`/`mimpid`/`mhartid`/`misa` 属只读/常量，写入被忽略（这是合法的 WARL 结果）。
 
 ### WARL 字段
 
@@ -192,10 +170,13 @@ CSR 的正确性集中在三件事，缺一不可。
 
 | CSR | 合法化规则 |
 |-----|-----------|
-| `mstatus` | 保留 `SIE`/`MIE`/`SPIE`/`MPIE`/`SPP`/`MPP`；`MPP` 支持 M/S/U，保留编码合法化为 U，其余位读 0 |
+| `mstatus` | 保留 `SIE`/`MIE`/`SPIE`/`MPIE`/`SPP`/`MPP`/`TSR`；`MPP` 支持 M/S/U，保留编码合法化为 U，其余位读 0 |
 | `mtvec` | mode 0/1 保留，保留值 2/3 合法化为 0；基址天然 4 字节对齐 |
 | `mepc` | 屏蔽最低两位（IALIGN = 32） |
-| `mie` | 仅保留 MEIE(11)/MTIE(7)/MSIE(3)；虽有 S/U 特权级，当前尚无 S 级中断交付 |
+| `mie` | 保留 M/S 的外部、软件、定时器使能位（11/9/7/5/3/1） |
+| `mip` | M/S 设备信号与软件 pending 逻辑或；仅 S 级 pending 位可由 M 写入，读改写不会锁存设备信号 |
+| `medeleg` / `mideleg` | 分别保留 `0x3ff` / `0x222` |
+| `satp`、TVM、SUM、MXR | 仅 Bare，无 ASID/页表根，全部读零；`SFENCE.VMA` 非法 |
 | `misa` | 常量 `0x40001100`（MXL=1，扩展 I 与 M；Zicsr 由基础隐含，无 `misa` 位） |
 
 ### 计数器与时间
@@ -248,12 +229,12 @@ CSR 的正确性集中在三件事，缺一不可。
 - `ebreak` 不退休
 - 写入 `minstret` 抑制该指令自身的计数增量（`architecture.rs`）
 - 非对齐数据访问完成而非陷阱，且只写自己宽度覆盖的字节（`architecture.rs`）
-- hart 复位在 M 级；`mret` 是唯一降低特权级的途径；`MPP` 记录陷阱来源模式（`privilege.rs`）
+- hart 复位在 M 级；`mret`/`sret` 恢复保存的特权级；`MPP` 记录陷阱来源模式（`privilege.rs`）
 - 低于所需等级的 CSR 访问是**非法指令**而非读到别人的状态（`privilege.rs`）
 - 经 `sstatus`/`sie` 别名写入不触及机器级字段（`privilege.rs`）
-- 中断在步骤边界交付，`mcause` 是中断位本身，`mtval` 为 0（`interrupts.rs`）
+- 中断在步骤边界交付，`xcause` 含最高位中断标记和原因号，`mtval` 为 0（`interrupts.rs`）
 - vectored `mtvec` 只对中断偏移，异常仍进基址（`interrupts.rs`）
-- `mip` 由设备驱动且对软件只读；`mcountinhibit.IR` 抑制 `instret`（`interrupts.rs`）
+- `mip` 的 M 级源由设备驱动，S 级源支持软件注入；`mcountinhibit.IR` 抑制 `instret`（`interrupts.rs`）
 - `mtime` 跟随 CLINT，无 CLINT 时退回模型计数器（`interrupts.rs`）
 - 挂 trace 不改变执行：寄存器、计数器、内存逐一相同（`trace.rs`）
 - 每条 trace 行的确切文本（`trace.rs`）——这是「格式已冻结」的实际含义
@@ -264,9 +245,9 @@ CSR 的正确性集中在三件事，缺一不可。
 
 ### 官方套件
 
-上述不变量之外，`scripts/riscv-tests.sh` 跑官方 `rv32ui-p-*` 与 `rv32mi-p-*`，**55 通过、0 失败、3 excluded**。它比任何手写测试都更容易发现语义偏差——本项目中被它抓出的四处（`minstret` 抑制、非对齐数据访问、`csr[9:8]` 特权表方向、陷阱入口的 `MPP` 写入）都不是靠推理想到的。修改执行语义后应先跑它。
+上述不变量之外，`scripts/riscv-tests.sh` 跑官方 `rv32ui-p-*` 与 `rv32mi-p-*`，**56 通过、0 失败、2 excluded**。它比任何手写测试都更容易发现语义偏差——本项目中被它抓出的四处（`minstret` 抑制、非对齐数据访问、`csr[9:8]` 特权表方向、陷阱入口的 `MPP` 写入）都不是靠推理想到的。修改执行语义后应先跑它。
 
-被排除的三项写进 `scripts/riscv-tests.sh` 的注释并说明缺什么，而不是当作通过：这样表头的数字才有意义，被支持的测试里出回归也不会被淹没。
+被排除的两项写进 `scripts/riscv-tests.sh` 的注释并说明缺什么，而不是当作通过：这样表头的数字才有意义，被支持的测试里出回归也不会被淹没。
 
 `scripts/difftest.sh` 是可选的第三重安全网：与 Spike 逐步比对 PC、指令字、目的寄存器值与内存写入。它**不属于门禁**——Spike 不在 apt 源中，当前 CI 未配置 Spike 的固定版本构建与缓存；缺 Spike 时它打印 `SKIP` 并以 0 退出，`--require` 可让缺失变成失败。
 
@@ -304,7 +285,7 @@ x <step> pc=<8 hex> inst=<8 hex> [...]
 - **非对齐数据访问**。Spike 抛地址未对齐异常，模型完成访问（`riscv-tests` 的 `ma_data` 与真实硬件都要求拿到值）。两者都合规，而一条分歧指令会使其后每一条都错位。模型的期望值由官方套件断言。
 - **取值由实现决定的寄存器**。`misa` 报告该实现提供的扩展（Spike 声明模型没有的 U 与 X），计数器在各自机器上没有意义。`misa` 的期望值由模型自己的测试逐字钉住。
 
-`scripts/difftest.S` 因此是一个**自带**的探针程序，而不是任何套件成员：官方测试的序言会探测 `mnstatus`、`pmpaddr0`、`medeleg`，而两侧实现的子集不同，会沿同一份源码走出不同路径，58 个套件全部在任何真实运算之前就分道扬镳。harness 把落在可选 CSR 上的分歧归类为 gap 而非发现。
+`scripts/difftest.S` 因此是一个**自带**的探针程序，而不是任何套件成员：官方测试的序言会探测可选 CSR，两侧实现子集不同，可能在真实运算前就走出不同路径。harness 把落在可选 CSR 上的分歧归类为 gap 而非发现。
 
 终止不通过 HTIF：Spike 内建 HTIF 与 `riscv-tests` 的 `tohost` 协议不同，且代理内核 `pk` 已从 riscv-isa-sim 移除，没有哪个 `tohost` 取值能让两侧都正确结束。程序改为停在 `pass_spin` 或 `fail_spin`，harness 从最终 PC 读出结论。
 
@@ -312,12 +293,12 @@ x <step> pc=<8 hex> inst=<8 hex> [...]
 
 按对验证工作的阻塞程度排列，与 [`TODO.md`](TODO.md) 的优先级一致：
 
-1. **无陷阱委派**。`medeleg`/`mideleg` 不存在，所有陷阱都进 `mtvec`。`mstatus.TVM`/`TSR` 与 `sstatus.SUM`/`MXR` 也没有，因此 `rv32mi-p-illegal` 列为 excluded——模型有 S 级，该测试的探测不再短路，于是会走进这些尚不存在的机制。
-2. **无 PMP 与调试触发模块**。因此 `rv32mi-p-pmpaddr` 与 `rv32mi-p-breakpoint` 列为 excluded 而非通过。
-3. **无 S 级中断交付**。被委派的 MSI/SEI 无法经 `stvec` 进入。
-4. **无地址转换**。`satp` 存在但合法化为 Bare：有翻译模式读回却是 Bare 优于「模式已设但什么都不做」，后者是给「检查 satp 再信任指针」的软件设的陷阱。
-5. **无 PLIC**，故 `MEIP` 永不被置起（它可被使能，因此保留在 `mie`/`mip` 掩码里，否则那一位就是 CSR 文件里的一处安静的谎言）。
-6. **差分比较不含 CSR 写入**。Spike 的提交日志不记录 CSR 写入，故不在交集内；补充它需要比较最终架构状态。
+1. **无 PMP 与调试触发模块**。`rv32mi-p-pmpaddr` 与 `rv32mi-p-breakpoint` 仍为 excluded。`rv32mi-p-illegal` 已通过并纳入门禁。
+2. **无地址转换**。仅 Bare，`satp`/TVM/SUM/MXR 读零；选择不实现 `SFENCE.VMA` 并产生非法指令异常。引入 Sv32 时需要配套页表遍历、权限和 TVM 门控。
+3. **无 PLIC**。平台目前只有 CLINT，尚无外部中断控制器；S 级外部/定时器中断可由 M 软件注入。
+4. **差分比较不含 CSR 写入与完整最终状态**。新委派路径由定向回归与官方 `illegal` 测试验证，现有 225 步 Spike 探针尚不提供这部分完整差分覆盖。
+
+本次特权语义依据固定版本的官方手册：[Machine-Level ISA v1.13](https://docs.riscv.org/reference/isa/v20260120/priv/machine.html)（委派、中断与 TSR）及 [Supervisor-Level ISA v1.13](https://docs.riscv.org/reference/isa/v20260120/priv/supervisor.html)（CSR 视图、Bare 与 SFENCE.VMA）。
 
 ## 13. 扩展模型的方式
 

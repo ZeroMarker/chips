@@ -245,39 +245,21 @@ fn sret_from_user_mode_is_illegal() {
 }
 
 #[test]
-fn sret_sets_spp_to_supervisor_so_it_cannot_climb() {
-    // After sret, SPP is S. A second sret from the mode it landed in therefore
-    // returns to S again, not to something higher.
+fn sret_clears_spp_to_user_after_return() {
     let (mut cpu, mut mem) = machine_with_handler(&[sret()]);
     enter(&mut cpu, Privilege::Supervisor, BODY);
-    load_words(&mut mem, BODY, &[sret()]);
-    cpu.set_pc(BODY);
-
-    let mut mem2 = mem;
-    cpu.step(&mut mem2).unwrap();
-    assert_eq!(cpu.privilege(), Privilege::User, "SPP was 0");
-    let spp = (cpu.csr().read(csr_addr::MSTATUS) >> 8) & 1;
-    assert_eq!(spp, 1, "sret leaves SPP = S");
+    assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::Continue));
+    assert_eq!(cpu.privilege(), Privilege::User);
+    assert_eq!(cpu.csr().read(csr_addr::MSTATUS) & (1 << 8), 0);
 }
 
 #[test]
-fn sfence_vma_is_legal_at_s_and_above_only() {
-    let (mut cpu, mut mem) = machine_with_handler(&[sfence_vma()]);
-
-    // Legal from machine mode: it retires.
-    enter(&mut cpu, Privilege::Machine, BODY);
-    assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::Continue));
-    assert_eq!(cpu.pc(), BODY + 4);
-
-    // Legal from supervisor mode.
-    let (mut cpu, mut mem) = machine_with_handler(&[sfence_vma()]);
-    enter(&mut cpu, Privilege::Supervisor, BODY);
-    assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::Continue));
-
-    // Illegal from user mode.
-    let (mut cpu, mut mem) = machine_with_handler(&[sfence_vma()]);
-    enter(&mut cpu, Privilege::User, BODY);
-    assert_illegal(&mut cpu, &mut mem, sfence_vma());
+fn bare_only_sfence_vma_is_illegal_in_every_mode() {
+    for mode in Privilege::ALL {
+        let (mut cpu, mut mem) = machine_with_handler(&[sfence_vma()]);
+        enter(&mut cpu, mode, BODY);
+        assert_illegal(&mut cpu, &mut mem, sfence_vma());
+    }
 }
 
 #[test]
@@ -394,30 +376,31 @@ fn writing_sstatus_leaves_the_machine_fields_alone() {
 fn sie_and_mie_share_storage() {
     let (mut cpu, mut mem) = machine_with_handler(&[]);
     let words = [
-        li(5, 0x80),                // x5 = MTIE
-        csrrw(csr_addr::SIE, 5, 0), // set MTIE through sie
-        csrrs(csr_addr::MIE, 0, 6), // read it through mie
-        csrrs(csr_addr::MIE, 0, 7), // and again
+        li(5, 2),                       // x5 = SSIE
+        csrrw(csr_addr::MIDELEG, 5, 0), // delegate SSI to expose it through sie
+        csrrw(csr_addr::SIE, 5, 0),     // set SSIE through sie
+        csrrs(csr_addr::MIE, 0, 6),     // read it through mie
+        csrrs(csr_addr::MIE, 0, 7),     // and again
     ];
     load_words(&mut mem, 0x6000, &words);
     cpu.set_pc(0x6000);
     for _ in 0..words.len() {
         cpu.step(&mut mem).unwrap();
     }
-    assert_eq!(cpu.reg(6) & 0x80, 0x80, "MTIE visible through mie");
+    assert_eq!(cpu.reg(6) & 2, 2, "SSIE visible through mie");
     // A pure read of mie with rs1 = x0 does not write, so the second read is
     // still there.
-    assert_eq!(cpu.reg(7) & 0x80, 0x80);
+    assert_eq!(cpu.reg(7) & 2, 2);
 }
 
 #[test]
 fn satp_legalizes_to_bare_because_there_is_no_translation() {
-    // Writing Sv39 would otherwise leave a mode set that does nothing, and
+    // Writing Sv32 must not enable unimplemented translation, and
     // software that checks satp before trusting a pointer would be misled.
     let (mut cpu, mut mem) = machine_with_handler(&[]);
     let words = [
-        li32(5, 0x80D)[0],
-        li32(5, 0x80D)[1],           // x5 = mode 8 (Sv39)
+        li32(5, 0x8000_000d)[0],
+        li32(5, 0x8000_000d)[1],     // RV32 MODE = Sv32
         csrrw(csr_addr::SATP, 5, 0), // attempt to enable translation
         csrrs(csr_addr::SATP, 0, 6), // read it back
     ];
@@ -426,7 +409,11 @@ fn satp_legalizes_to_bare_because_there_is_no_translation() {
     for _ in 0..words.len() {
         cpu.step(&mut mem).unwrap();
     }
-    assert_eq!(cpu.reg(6) & 0b1111, 0, "reads back as Bare");
+    assert_eq!(
+        cpu.reg(6),
+        0,
+        "reads back as Bare with no ASIDs or page root"
+    );
 }
 
 #[test]

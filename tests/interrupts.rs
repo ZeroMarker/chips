@@ -203,8 +203,8 @@ fn an_enabled_pending_interrupt_is_taken_before_the_next_instruction() {
     assert_eq!(cpu.pc(), HANDLER, "entered the handler");
     assert_eq!(
         cpu.csr().read(csr_addr::MCAUSE),
-        MIP_MSIP,
-        "an interrupt's mcause is the bit itself"
+        0x8000_0003,
+        "mcause contains the interrupt flag and cause number"
     );
     assert_eq!(
         cpu.csr().read(csr_addr::MEPC),
@@ -278,7 +278,7 @@ fn a_disabled_source_does_not_interrupt() {
 
 #[test]
 fn the_highest_priority_source_wins() {
-    // Both sources pending and enabled. MTI outranks MSI, so the timer is taken.
+    // Both sources pending and enabled. MSI outranks MTI in the privileged ISA.
     let mut program = arm(HANDLER, MIP_MSIP | MIP_MTIP);
     program.extend([addi(0, 0, 0), ebreak()]);
 
@@ -293,22 +293,21 @@ fn the_highest_priority_source_wins() {
     assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::TrapTaken));
     assert_eq!(
         cpu.csr().read(csr_addr::MCAUSE),
-        MIP_MTIP,
-        "MTI outranks MSI"
+        0x8000_0003,
+        "MSI outranks MTI"
     );
 }
 
 #[test]
-fn the_external_source_outranks_both() {
-    // MEI is the highest machine priority. No PLIC exists, so this asserts the
-    // *ordering* is encoded in the machine rather than only in the CLINT: if
-    // both MEI and MSI are somehow set, MEI is the one delivered.
+fn clint_does_not_raise_an_enabled_external_source() {
+    // Enabling an external interrupt must not invent a source. A CLINT only
+    // drives MSI/MTI; actual MEI/MSI/MTI priority is tested in delegation.rs.
     let mut program = arm(HANDLER, MIP_MEIP | MIP_MSIP);
     program.extend([addi(0, 0, 0), ebreak()]);
 
     let (mut cpu, mut mem, clint) = machine_with_clint(&program);
     clint.set_software_interrupt_pending(true);
-    // Force the external bit into the latch the way a PLIC would.
+    // Assert only the memory-mapped software interrupt.
     mem.store(MSIP_ADDR, 4, 1).unwrap();
 
     for _ in 0..ARM_SETUP {
@@ -317,7 +316,7 @@ fn the_external_source_outranks_both() {
     assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::TrapTaken));
     assert_eq!(
         cpu.csr().read(csr_addr::MCAUSE),
-        MIP_MSIP,
+        0x8000_0003,
         "only the CLINT can assert a bit, so MSI is what is actually pending"
     );
 }
@@ -340,7 +339,7 @@ fn vectored_mode_offsets_by_cause() {
     assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::TrapTaken));
     assert_eq!(
         cpu.pc(),
-        HANDLER + 4 * MIP_MTIP,
+        HANDLER + 4 * 7,
         "vectored entry is base + 4 * cause"
     );
 }
@@ -378,9 +377,9 @@ fn mip_reflects_the_devices() {
 }
 
 #[test]
-fn software_cannot_write_mip() {
-    // Every `mip` bit belongs to an interrupt controller, so a write from
-    // software must not be able to invent a pending interrupt.
+fn software_cannot_write_machine_pending_bits() {
+    // Machine pending bits belong to the interrupt controller, so software
+    // cannot invent a machine timer interrupt by writing mip.
     let program = [
         li(2, MIP_MTIP as i32),
         csrrw(csr_addr::MIP, 2, 0), // must be ignored
@@ -424,7 +423,7 @@ fn mret_restores_the_interrupt_enable_stack() {
     // is correct: a level-triggered interrupt stays pending until the handler
     // clears it.
     assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::TrapTaken));
-    assert_eq!(cpu.csr().read(csr_addr::MCAUSE), MIP_MSIP);
+    assert_eq!(cpu.csr().read(csr_addr::MCAUSE), 0x8000_0003);
 }
 
 #[test]
@@ -453,7 +452,7 @@ fn wfi_completes_and_does_not_mask_the_next_interrupt() {
     // is not a way to skip past it.
     clint.set_software_interrupt_pending(true);
     assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::TrapTaken));
-    assert_eq!(cpu.csr().read(csr_addr::MCAUSE), MIP_MSIP);
+    assert_eq!(cpu.csr().read(csr_addr::MCAUSE), 0x8000_0003);
     assert_eq!(
         cpu.csr().read(csr_addr::MEPC),
         CODE + 32,

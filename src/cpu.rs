@@ -6,27 +6,16 @@
 //!
 //! # Trap handling
 //!
-//! A synchronous exception or an `ecall`/`ebreak` enters the machine-mode
-//! handler described by `mtvec`: `mepc`, `mcause` and `mtval` are written, the
-//! interrupt-enable stack is pushed in `mstatus` (`MIE` into `MPIE`, `MIE`
-//! cleared, `MPP` = M), and the PC is set to the `mtvec` base. `mret` unwinds
-//! that state: `MIE` is restored from `MPIE`, `MPIE` is set, and the PC returns
-//! to `mepc`. Synchronous exceptions always enter at the `mtvec` base, even
-//! when `mtvec` selects vectored mode, because only interrupts are vectored.
-//!
-//! A handler counts as installed when `mtvec` is non-zero. With no handler the
-//! model has no architecturally meaningful target to jump to, so exceptions are
-//! reported to the caller as a [`Trap`] and `ecall`/`ebreak` end the
-//! [`Cpu::run`] loop — which is what lets a bare-metal image halt itself.
-//!
-//! Only machine mode exists, so `mstatus.MPP` is hardwired to M and `mret`
-//! always returns to machine mode. Interrupts are not delivered: `mip` reads
-//! zero and `mie` only stores the M-mode enable bits. `wfi` retires
-//! immediately because there is no interrupt source to wait for.
+//! Traps from S/U route to S-mode when delegated, otherwise to M-mode. Traps
+//! originating in M never delegate. Entry saves EPC/cause/tval and the target
+//! mode's interrupt-enable stack; xRET restores it and clears xPP to U.
+//! Interrupts use the architectural high-bit cause encoding and vector by the
+//! cause number. A zero target tvec keeps the bare-metal halt/error convention
+//! for synchronous traps. WFI completes immediately as a hint.
 
 use crate::csr::{
     addr as csr_addr, Csr, MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP, MSTATUS_MPP_SHIFT, MSTATUS_SIE,
-    MSTATUS_SPIE, MSTATUS_SPP,
+    MSTATUS_SPIE, MSTATUS_SPP, MSTATUS_TSR,
 };
 use crate::isa::{self, Decoded, Privilege};
 use crate::mem::Memory;
@@ -37,7 +26,7 @@ use crate::trace::{Change, Record, StepResult, Trace};
 pub enum StepOutcome {
     /// Instruction retired normally; PC already advanced.
     Continue,
-    /// A trap was taken: the PC is now at the `mtvec` handler and the trap CSRs
+    /// A trap was taken: the PC is now at the selected M/S handler and the trap CSRs
     /// describe the cause.
     TrapTaken,
     /// `ecall` was executed with no handler installed — the program requested
@@ -232,14 +221,12 @@ impl Cpu {
 
     /// Value returned by the `time`/`timeh` CSRs.
     ///
-    /// The model advances it once per step. A real hart reads this from the
-    /// memory-mapped `mtime` register of the interrupt controller, which arrives
-    /// with the SoC phase; until then this is the time base.
+    /// Follows CLINT when present, otherwise advances once per step.
     pub fn mtime(&self) -> u64 {
         self.mtime
     }
 
-    /// Set the model time base, e.g. from a future CLINT implementation.
+    /// Set the fallback model time base (a mapped CLINT overrides it).
     pub fn set_mtime(&mut self, mtime: u64) {
         self.mtime = mtime;
     }
@@ -398,10 +385,21 @@ impl Cpu {
         let result = match &outcome {
             Ok(StepOutcome::Continue) => StepResult::Retired,
             // A taken trap is not a retirement, but the run continues.
-            Ok(StepOutcome::TrapTaken) => StepResult::Trap {
-                cause: self.csr.read(csr_addr::MCAUSE),
-                tval: self.csr.read(csr_addr::MTVAL),
-            },
+            Ok(StepOutcome::TrapTaken) => {
+                let supervisor = self.privilege == Privilege::Supervisor;
+                StepResult::Trap {
+                    cause: self.csr.read(if supervisor {
+                        csr_addr::SCAUSE
+                    } else {
+                        csr_addr::MCAUSE
+                    }),
+                    tval: self.csr.read(if supervisor {
+                        csr_addr::STVAL
+                    } else {
+                        csr_addr::MTVAL
+                    }),
+                }
+            }
             // ecall/ebreak with no handler: the run stops here.
             Ok(_) => StepResult::Halt,
             // A trap that had nowhere to go is reported to the caller. It never
@@ -436,108 +434,113 @@ impl Cpu {
         self.csr.read(csr_addr::MCOUNTINHIBIT) & (1 << 2) != 0
     }
 
-    /// The cause of the interrupt that should be taken now, if any.
-    ///
-    /// An interrupt is taken when it is pending in `mip`, enabled in `mie`, and
-    /// the global enable `mstatus.MIE` is set. When several qualify, the highest
-    /// numbered wins, which is the platform's fixed priority: MEI (11) over MTI
-    /// (7) over MSI (3).
+    /// Select the highest-priority eligible interrupt. Machine-targeted
+    /// interrupts preempt supervisor-targeted ones regardless of their number.
     fn pending_interrupt(&self) -> Option<u32> {
-        let enabled = self.mip & self.csr.read(csr_addr::MIE);
-        if enabled == 0 || self.csr.read(csr_addr::MSTATUS) & MSTATUS_MIE == 0 {
-            return None;
-        }
-        // The highest set bit of `enabled`, as the bit's own value: for an
-        // interrupt, `mcause` *is* the bit number, not an index.
-        Some(1u32 << (31 - enabled.leading_zeros()))
+        let pending = (self.mip | self.csr.read(csr_addr::MIP)) & self.csr.read(csr_addr::MIE);
+        let delegated = self.csr.read(csr_addr::MIDELEG);
+        let status = self.csr.read(csr_addr::MSTATUS);
+        let machine_enabled = self.privilege < Privilege::Machine || status & MSTATUS_MIE != 0;
+        let supervisor_enabled = self.privilege < Privilege::Supervisor
+            || (self.privilege == Privilege::Supervisor && status & MSTATUS_SIE != 0);
+        let eligible = (if machine_enabled {
+            pending & !delegated
+        } else {
+            0
+        }) | (if supervisor_enabled {
+            pending & delegated
+        } else {
+            0
+        });
+        // Privileged ISA fixed priority: MEI, MSI, MTI, SEI, SSI, STI.
+        [11, 3, 7, 9, 1, 5]
+            .into_iter()
+            .find(|cause| eligible & !delegated & (1 << cause) != 0)
+            .or_else(|| {
+                [9, 1, 5]
+                    .into_iter()
+                    .find(|cause| eligible & delegated & (1 << cause) != 0)
+            })
     }
 
-    /// Take an interrupt, entering the machine-mode handler.
-    ///
-    /// Differs from a synchronous exception in two ways that matter: `mcause` is
-    /// the interrupt bit rather than a reason code, and `mtval` is zero because
-    /// an interrupt has no faulting address. In vectored mode the entry point is
-    /// `mtvec` base + 4 * cause, which is the one case where vectoring applies.
     fn handle_interrupt(&mut self, cause: u32) -> Result<StepOutcome, Trap> {
-        self.write_trap_csrs(self.pc, cause, 0);
-        self.enter_machine_mode();
-
-        let mtvec = self.csr.read(csr_addr::MTVEC);
-        // Bit 0 of mtvec selects the mode: 1 is vectored, and only interrupts
-        // are ever vectored.
-        let entry = if mtvec & 0b11 == 1 {
-            mtvec.wrapping_add(4 * cause)
-        } else {
-            mtvec
-        };
-        self.pc = entry & !0b11;
+        let supervisor = self.csr.read(csr_addr::MIDELEG) & (1 << cause) != 0;
+        self.enter_trap(supervisor, (1 << 31) | cause, 0, true);
         Ok(StepOutcome::TrapTaken)
     }
 
-    /// Deliver a trap, or report it when there is nowhere to deliver it.
+    /// Deliver synchronous traps to their delegated target. A missing target
+    /// handler retains the driver's explicit halt/error convention.
     fn handle_trap(&mut self, trap: Trap) -> Result<StepOutcome, Trap> {
-        if !self.handler_installed() {
-            // No handler: `ecall`/`ebreak` end the run loop so a bare-metal
-            // image can halt itself, and every other exception is the caller's
-            // problem.
+        let supervisor = self.privilege != Privilege::Machine
+            && self.csr.read(csr_addr::MEDELEG) & (1 << trap.mcause()) != 0;
+        let vector = if supervisor {
+            csr_addr::STVEC
+        } else {
+            csr_addr::MTVEC
+        };
+        if self.csr.read(vector) == 0 {
             return match trap {
                 Trap::EnvironmentCall { .. } => Ok(StepOutcome::Ecall),
                 Trap::Breakpoint(_) => Ok(StepOutcome::Ebreak),
                 other => Err(other),
             };
         }
-
-        self.write_trap_csrs(self.pc, trap.mcause(), trap.mtval());
-        self.enter_machine_mode();
-
-        // A synchronous exception enters at BASE even in vectored mode.
-        self.pc = self.csr.read(csr_addr::MTVEC) & !0b11;
+        self.enter_trap(supervisor, trap.mcause(), trap.mtval(), false);
         Ok(StepOutcome::TrapTaken)
     }
 
-    /// Write `mepc`/`mcause`/`mtval` and record them.
-    ///
-    /// Trap entry writes the CSR file directly rather than going through the
-    /// Zicsr path, so the change vector has to be told about it here — otherwise
-    /// a trace would show a trap that apparently changed nothing, and a
-    /// differential run could not tell where the handler was sent.
-    fn write_trap_csrs(&mut self, epc: u32, cause: u32, tval: u32) {
-        for (address, value) in [
-            (csr_addr::MEPC, epc & !0b11),
-            (csr_addr::MCAUSE, cause),
-            (csr_addr::MTVAL, tval),
-        ] {
-            self.csr.write(address, value);
-            self.changes.push(Change::Csr {
-                address,
-                value: self.csr.read(address),
-            });
+    /// Save only the target privilege's trap state and enable stack. All writes
+    /// pass through the trace collector, including entry into S-mode.
+    fn enter_trap(&mut self, supervisor: bool, cause: u32, tval: u32, interrupt: bool) {
+        let (epc, cause_csr, tval_csr, vector, enable, saved, previous) = if supervisor {
+            (
+                csr_addr::SEPC,
+                csr_addr::SCAUSE,
+                csr_addr::STVAL,
+                csr_addr::STVEC,
+                MSTATUS_SIE,
+                MSTATUS_SPIE,
+                MSTATUS_SPP,
+            )
+        } else {
+            (
+                csr_addr::MEPC,
+                csr_addr::MCAUSE,
+                csr_addr::MTVAL,
+                csr_addr::MTVEC,
+                MSTATUS_MIE,
+                MSTATUS_MPIE,
+                MSTATUS_MPP,
+            )
+        };
+        self.write_csr(epc, self.pc);
+        self.write_csr(cause_csr, cause);
+        self.write_csr(tval_csr, tval);
+        let status = self.csr.read(csr_addr::MSTATUS);
+        let mut next = status & !(enable | saved | previous);
+        if status & enable != 0 {
+            next |= saved;
         }
-    }
-
-    /// The state change on entering machine mode: record where the trap came
-    /// from in `MPP` and push the interrupt-enable stack.
-    ///
-    /// `MPP` records the *previous* privilege, which is what lets `mret` go back
-    /// down to it. There is no delegation in this model, so every trap — from any
-    /// mode — lands here.
-    fn enter_machine_mode(&mut self) {
-        let mstatus = self.csr.read(csr_addr::MSTATUS);
-        let mut next = mstatus & !(MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP);
-        if mstatus & MSTATUS_MIE != 0 {
-            next |= MSTATUS_MPIE; // MPIE <- MIE
+        if supervisor {
+            if self.privilege == Privilege::Supervisor {
+                next |= MSTATUS_SPP;
+            }
+        } else {
+            next |= self.privilege.encoding() << MSTATUS_MPP_SHIFT;
         }
-        // MPP records the mode the trap came from, not "machine". A trap taken
-        // while already in M leaves MPP = M, which is the same encoding; the
-        // difference only shows for S and U, and it is what lets `mret` go back
-        // down instead of trapping in a loop.
-        next |= self.privilege.encoding() << MSTATUS_MPP_SHIFT;
-        self.csr.write(csr_addr::MSTATUS, next);
-        self.changes.push(Change::Csr {
-            address: csr_addr::MSTATUS,
-            value: self.csr.read(csr_addr::MSTATUS),
+        self.write_csr(csr_addr::MSTATUS, next);
+        self.privilege = if supervisor {
+            Privilege::Supervisor
+        } else {
+            Privilege::Machine
+        };
+        let tvec = self.csr.read(vector);
+        self.pc = (tvec & !0b11).wrapping_add(if interrupt && tvec & 0b11 == 1 {
+            4 * (cause & !(1 << 31))
+        } else {
+            0
         });
-        self.privilege = Privilege::Machine;
     }
 
     fn execute(&mut self, inst: Decoded, mem: &mut Memory) -> Result<StepOutcome, Trap> {
@@ -754,15 +757,18 @@ impl Cpu {
                 pc,
             }),
             isa::system::EBREAK if no_operands => Err(Trap::Breakpoint(pc)),
-            // MRET is legal only at M. It is the sole way to *lower* privilege,
-            // and it sets MPP to M because that is where the return lands.
+            // MRET is legal only at M and resumes the saved MPP privilege.
             isa::system::MRET if no_operands && self.privilege == Privilege::Machine => {
                 self.execute_return(Privilege::Machine)
             }
             // SRET is legal at S and above. It returns to SPP, which cannot
-            // express M — that is what makes S the most privileged mode it can
-            // be used from.
-            isa::system::SRET if no_operands && self.privilege >= Privilege::Supervisor => {
+            // express M, so S is the highest privilege it can return to.
+            isa::system::SRET
+                if no_operands
+                    && self.privilege >= Privilege::Supervisor
+                    && (self.privilege == Privilege::Machine
+                        || self.csr.read(csr_addr::MSTATUS) & MSTATUS_TSR == 0) =>
+            {
                 self.execute_return(Privilege::Supervisor)
             }
             // WFI is legal in every mode and is only a hint: it may complete
@@ -775,17 +781,9 @@ impl Cpu {
                 self.pc = pc.wrapping_add(4);
                 Ok(StepOutcome::Continue)
             }
-            // SFENCE.VMA orders a TLB update and is legal at S and above. There
-            // is no address translation in this model, so there is no TLB to
-            // flush and the instruction retires having done nothing. Keeping it
-            // legal matters: an S-mode program that issues it must not take an
-            // illegal-instruction trap for a no-op the architecture permits.
-            0x120..=0x12F if self.privilege >= Privilege::Supervisor => {
-                self.pc = pc.wrapping_add(4);
-                Ok(StepOutcome::Continue)
-            }
-            // MRET or SRET from a mode that may not execute them, SFENCE.VMA
-            // from U, and every other encoding here, are all illegal.
+            // Bare-only implementation: SFENCE.VMA is unsupported in every
+            // mode, SUM/MXR/TVM are read-only zero, and satp reads zero. This
+            // matches the Bare path of riscv-tests' illegal-instruction test.
             _ => Err(Trap::IllegalInstruction(inst.raw)),
         }
     }
@@ -824,14 +822,9 @@ impl Cpu {
         }
         .unwrap_or(Privilege::User);
 
-        if machine {
-            // MPP becomes M, because `mret` lands in machine mode.
-            next |= MSTATUS_MPP;
-        } else {
-            // SPP becomes S, because `sret` lands in supervisor mode.
-            next |= MSTATUS_SPP;
-        }
-        self.csr.write(csr_addr::MSTATUS, next);
+        // Reset the saved privilege to the least privileged supported mode.
+        next &= if machine { !MSTATUS_MPP } else { !MSTATUS_SPP };
+        self.write_csr(csr_addr::MSTATUS, next);
 
         self.privilege = target;
         self.pc = if machine {
@@ -870,11 +863,18 @@ impl Cpu {
 
         // A write happens for CSRRW/CSRRWI always, and for CSRRS/CSRRC only when
         // the source field is non-zero (a pure read).
+        // Device interrupt signals contribute to the read result, but must
+        // never get latched into the software-injected pending bits by RMW.
+        let write_old = if matches!(address, csr_addr::MIP | csr_addr::SIP) {
+            self.csr.read(address)
+        } else {
+            old
+        };
         let write = match inst.funct3 & 0b011 {
-            0b001 => Some(source),                         // csrrw(i)
-            0b010 if inst.rs1 != 0 => Some(old | source),  // csrrs(i)
-            0b011 if inst.rs1 != 0 => Some(old & !source), // csrrc(i)
-            0b010 | 0b011 => None,                         // rs1 = x0: read only, never a write
+            0b001 => Some(source),                               // csrrw(i)
+            0b010 if inst.rs1 != 0 => Some(write_old | source),  // csrrs(i)
+            0b011 if inst.rs1 != 0 => Some(write_old & !source), // csrrc(i)
+            0b010 | 0b011 => None, // rs1 = x0: read only, never a write
             _ => return Err(Trap::IllegalInstruction(inst.raw)),
         };
 
@@ -901,7 +901,10 @@ impl Cpu {
             csr_addr::TIME => self.mtime as u32,
             csr_addr::TIMEH => (self.mtime >> 32) as u32,
             // Driven by the interrupt controller, not stored.
-            csr_addr::MIP => self.mip,
+            csr_addr::MIP => self.mip | self.csr.read(csr_addr::MIP),
+            csr_addr::SIP => {
+                (self.mip | self.csr.read(csr_addr::MIP)) & self.csr.read(csr_addr::MIDELEG)
+            }
             _ => self.csr.read(address),
         }
     }

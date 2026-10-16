@@ -59,8 +59,8 @@ impl Privilege {
 
     /// May code running at `self` access a register requiring `required`?
     ///
-    /// Delegation is deliberately not consulted: this model has no `medeleg`, so
-    /// nothing can be delegated and the rule is simply "at least as privileged".
+    /// Trap delegation does not grant CSR access: the current mode must still
+    /// be at least as privileged as the CSR requires.
     pub fn can_access(self, required: Privilege) -> bool {
         self >= required
     }

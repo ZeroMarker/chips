@@ -4,12 +4,12 @@
 
 当前轨道 A 已实现一个可执行的 **RV32IMZicsr** 核心：完整 RV32I 基础整数集、RV32M 乘除、Zicsr CSR 访问，**M/S/U 三级特权**与陷阱进入、CLINT 中断交付与内存映射 `mtime`。它是后续 RTL 的**黄金参考模型**——RTL 必须与它跑同一套程序、得到一致结果。
 
-模型已接入官方 **`riscv-tests`** 一致性套件：`rv32ui-p-*` 与 `rv32mi-p-*` 共 58 个测试中 **55 个通过**，另 3 个因需要尚未实现的硬件设施而排除（详见下文）。
+模型已接入官方 **`riscv-tests`** 一致性套件：`rv32ui-p-*` 与 `rv32mi-p-*` 共 58 个测试中 **56 个通过**，另 2 个因需要尚未实现的硬件设施而排除（详见下文）。
 
 模型同时接入 **Spike 差分测试**：`scripts/difftest.sh` 在同一程序上逐步比较 PC、指令字、目的寄存器与其值、内存写入的地址与值。当前自带的 225 步探针程序两侧一致，尚未覆盖随机指令流、CSR 写入与完整最终架构状态。
 
 - 目标配置：`RV32IMC` 起步（当前 `RV32IMZicsr`，`C` 扩展待做）
-- 特权级：M / S / U（**无陷阱委派**，`medeleg`/`mideleg` 待做）
+- 特权级：M / S / U；支持 `medeleg`/`mideleg` 陷阱委派与 S 级中断，地址翻译仅支持 Bare
 - 硬件轨道：RTL 与 Verilator 尚未纳入本仓库；Spike 作为外部参考已接入差分测试
 
 ## 当前完成程度
@@ -18,8 +18,8 @@
 
 | 本地检查 | 结果 |
 |----------|------|
-| Rust 测试（debug / release） | 每种 profile 均为 139 通过、0 失败 |
-| 官方选定套件（`rv32ui-p-*` / `rv32mi-p-*`） | 55 通过、0 失败、3 排除、0 跳过 |
+| Rust 测试（debug / release） | 每种 profile 均为 150 通过、0 失败 |
+| 官方选定套件（`rv32ui-p-*` / `rv32mi-p-*`） | 56 通过、0 失败、2 排除、0 跳过 |
 | Spike 自带探针 | 225 步程序一致；脚本共比较 1999 条退休记录，包含末尾自旋 |
 | 交叉工具链冒烟测试 | 通过 |
 | 格式、Clippy、rustdoc | 通过 |
@@ -57,7 +57,7 @@ cargo test --all-targets
 cargo test --release --all-targets    # release 关闭溢出检查，结果必须一致
 ```
 
-139 个测试，分布在：
+150 个测试，分布在：
 
 | 测试文件 | 数量 | 覆盖内容 |
 |----------|------|----------|
@@ -67,6 +67,7 @@ cargo test --release --all-targets    # release 关闭溢出检查，结果必�
 | `tests/memory.rs` | 15 | 地址映射、区域权限、访问故障、后备实现等价性 |
 | `tests/htif.rs` | 13 | `tohost` 协议编解码、`riscv-tests` 平台内存布局 |
 | `tests/interrupts.rs` | 19 | CLINT 寄存器、`mip`/`mie`/`MIE` 门控、优先级、向量入口、WFI |
+| `tests/delegation.rs` | 11 | 委派、中断门控矩阵、CSR 别名、嵌套陷阱、TSR、Bare 能力与 trace |
 | `tests/privilege.rs` | 22 | M/S/U 转换、`ecall` 原因码、`mret`/`sret`、CSR 特权判定、别名 |
 | `tests/trace.rs` | 23 | trace 格式的逐字文本，以及「挂 trace 不改变执行」 |
 | `tests/architecture.rs` | 7 | 取指对齐、非对齐数据访问、计数器、保留编码 |
@@ -176,15 +177,14 @@ RISCV_TESTS_DIR=/path/to/tree scripts/riscv-tests.sh   # 复用已有克隆（�
 
 脚本会克隆 `riscv-tests`（含 `env` 子模块）、以 `XLEN=32` 配置、构建 `rv32ui-p-*` 与 `rv32mi-p-*`，然后逐个在模型上运行。
 
-当前结果：**58 个测试，55 通过，0 失败，3 排除**。被排除的三个需要模型尚未实现的设施，因此单独报告而非计入通过：
+当前结果：**58 个测试，56 通过，0 失败，2 排除**。被排除的两个需要模型尚未实现的设施，因此单独报告而非计入通过：
 
 | 测试 | 需要 |
 |------|------|
 | `rv32mi-p-breakpoint` | 调试触发模块（`tcontrol`/`tselect`/`tdata1-3`） |
 | `rv32mi-p-pmpaddr` | 物理内存保护（`pmpcfg0`/`pmpaddr0-15`） |
-| `rv32mi-p-illegal` | 陷阱委派（`medeleg`/`mideleg`）与 `mstatus.TVM`/`TSR`、`sstatus.SUM`/`MXR` |
 
-最后一项值得说明：模型**现在**有 S 级，所以该测试探测 S 级时不再短路，而是会继续走进 `mideleg`、向量化的监管级中断与上述门控机制——它以前走的正是「跳过」那条路径。排除项在脚本中显式列出并写明缺什么，任何**其他**测试失败都会使脚本以非零码退出。
+`rv32mi-p-illegal` 已解除排除并通过：支持软件置起 SSIP、正确的中断原因码与向量入口、`mideleg` 及 TSR 门控。模型选择 Bare-only 能力：`satp`、TVM、SUM、MXR 读零，`SFENCE.VMA` 产生非法指令异常，测试走无分页分支。剩余排除项在脚本中显式列出，任何其他测试失败都会令脚本以非零码退出。
 
 ## 与 Spike 的差分测试
 
@@ -197,7 +197,7 @@ SPIKE=/path/to/spike bash scripts/difftest.sh
 
 在同一程序上分别跑模型与 Spike，逐步比较**两者都报告的交集**：PC、指令字、目的寄存器与其值、内存写入的地址与值。只比较已退休的指令——Spike 的提交日志仅记录这些。
 
-自带的探针程序是 `scripts/difftest.S`（**不是**任何套件成员）：官方测试的序言会探测可选 CSR，而两侧实现的子集不同，会沿同一份源码走出不同路径，58 个套件全部在任何真实运算之前就分道扬镳。当前结果：**225 步程序，两侧完全一致**。
+自带的探针程序是 `scripts/difftest.S`（**不是**任何套件成员）：官方测试的序言会探测可选 CSR，两侧实现的子集不同，可能在真实运算之前就走出不同路径。当前结果：**225 步程序，两侧完全一致**。
 
 两处必须留在比较范围之外，都是「架构未规定」而非缺陷：**非对齐数据访问**（Spike 陷阱、模型完成，两者都合规）与**取值由实现决定的寄存器**（`misa` 报告扩展位，计数器只在各自机器上有意义）。详见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §11。
 
@@ -227,7 +227,7 @@ scripts/riscv-smoke.sh --require    # 缺少工具链则失败——CI 用此模
 
 - 与 Spike 的差分比对——Spike **不在 apt 源中**，需从源码构建（`riscv-isa-sim`）。当前 CI 未配置 Spike 的固定版本构建与缓存，因此尚未将它纳入门禁：`bash scripts/difftest.sh` 在缺 Spike 时打印 `SKIP` 并以 0 退出，加 `--require` 可让缺失变成失败
 - RTL 硬件轨道——本仓库尚无 RTL
-- `rv32mi-p-breakpoint`、`rv32mi-p-pmpaddr` 与 `rv32mi-p-illegal`（见上文排除说明）
+- `rv32mi-p-breakpoint` 与 `rv32mi-p-pmpaddr`（见上文排除说明）
 
 另有一条硬性约束：`Cargo.toml` 中声明 `unsafe_code = "forbid"`，模型全部为安全 Rust。CI 将警告视为失败，因此这条约束是构建期检查而非约定。
 
@@ -236,9 +236,7 @@ scripts/riscv-smoke.sh --require    # 缺少工具链则失败——CI 用此模
 当前限制如下。未实现的指令扩展与 CSR 访问会报错；部分已存在的 CSR 只实现字段子集或固定读值（如 `satp` 固定为 Bare），不能据此视为完整支持：
 
 - `C`（压缩）、`A`（原子）、`F`/`D`（浮点）、`V`（向量）扩展
-- **陷阱委派**（`medeleg`/`mideleg`）与 `mstatus.TVM`/`TSR`、`sstatus.SUM`/`MXR`
-- S 级中断交付（被委派的 MSI/SEI 无法经 `stvec` 进入）
-- 虚拟内存与地址翻译（`satp` 存在但合法化为 Bare）
+- 虚拟内存与地址翻译：`satp` 固定读零（Bare），TVM/SUM/MXR 读零，`SFENCE.VMA` 非法；TSR 可写且对 S 级 SRET 生效
 - PMP 物理内存保护、调试触发模块
 - PLIC（故 `MEIP` 永不被置起）、外设总线与 boot ROM
 - 差分比较不含 CSR 写入——Spike 提交日志不记录它们，不在交集内

@@ -91,9 +91,9 @@ pub enum StepResult {
     Retired,
     /// A trap was taken. The step did not retire.
     Trap {
-        /// The architectural `mcause` value.
+        /// The architectural `mcause` or `scause` value.
         cause: u32,
-        /// The architectural `mtval` value.
+        /// The architectural `mtval` or `stval` value.
         tval: u32,
     },
     /// The run stopped: `ecall` or `ebreak` with no handler installed. The

@@ -325,7 +325,7 @@ fn misa_and_mhartid_are_read_only_constants() {
 }
 
 #[test]
-fn mie_masks_unsupported_bits_and_mip_is_inert() {
+fn mie_masks_unsupported_bits_and_mip_accepts_supervisor_injection() {
     let prog = [
         li(5, -1),
         csrrw(csr_addr::MIE, 5, 0),
@@ -334,10 +334,17 @@ fn mie_masks_unsupported_bits_and_mip_is_inert() {
         csrrs(csr_addr::MIP, 0, 7),
         ebreak(),
     ];
-    let cpu = run_until_halt(CODE, &prog);
-
-    assert_eq!(cpu.reg(6), 0x888, "only MEIE, MTIE and MSIE exist");
-    assert_eq!(cpu.reg(7), 0, "no interrupt source can raise mip");
+    let (mut cpu, mut mem) = machine(CODE, &prog);
+    // Inspect the CSR results directly; MIE remains clear during setup.
+    for _ in 0..5 {
+        assert_eq!(cpu.step(&mut mem), Ok(StepOutcome::Continue));
+    }
+    assert_eq!(cpu.reg(6), 0xaaa, "machine and supervisor enable bits");
+    assert_eq!(
+        cpu.reg(7),
+        0x222,
+        "only supervisor pending bits are writable"
+    );
 }
 
 #[test]
@@ -347,9 +354,8 @@ fn wfi_retires_in_every_mode() {
     assert_eq!(cpu.pc(), CODE + 4, "wfi advances the PC");
     assert_eq!(cpu.instret(), 1, "wfi is a legal, retiring instruction");
 
-    // `sret` and `sfence.vma` used to be illegal encodings here, because S-mode
-    // did not exist. They are legal from M now; the privilege gating is what
-    // tests/privilege.rs covers.
+    // WFI is a hint; SRET gating and Bare-only SFENCE.VMA rejection are
+    // covered by tests/privilege.rs and tests/delegation.rs.
 }
 
 #[test]

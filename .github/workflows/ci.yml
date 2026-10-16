@@ -124,9 +124,9 @@ jobs:
 
       # This is the ROADMAP P0/P1 acceptance criterion: the official rv32ui and
       # rv32mi suites running on the model, reporting through the tohost
-      # convention. Three tests are reported as excluded rather than passed,
+      # convention. Two tests are reported as excluded rather than passed,
       # because they need facilities the model does not implement (the debug
-      # trigger module, PMP, and trap delegation with related privilege fields).
+      # trigger module and PMP).
       # The script names them and fails on anything else, so a real regression
       # cannot hide behind them.
       - name: Build and run rv32ui-p-* and rv32mi-p-*

@@ -164,23 +164,18 @@ fn a_csr_write_records_the_legalized_value() {
     // register holds afterwards, not what was requested. A hardware comparison
     // has to agree on the legalized value.
     let lines = traced_run_at(&[
-        li32(5, 0x8D)[0],
-        li32(5, 0x8D)[1],
+        li32(5, 0x8000_008d)[0],
+        li32(5, 0x8000_008d)[1],
         csrrw(0x180, 5, 0),
         ebreak(),
     ]);
-    // 0x8D is mode 8 (Sv39) plus an ASID of 0x80. Only the mode is cleared; the
-    // ASID is a real field and survives.
+    // RV32 MODE is bit 31 (Sv32). Bare-only hardware exposes neither an
+    // ASID nor a page-table root, so the entire register remains zero.
     let recorded = lines[2]
         .split_whitespace()
         .find_map(|f| f.strip_prefix("c180="))
         .unwrap();
-    assert_eq!(recorded, "00000080", "{}", lines[2]);
-    assert_eq!(
-        u32::from_str_radix(&recorded[5..], 16).unwrap() & 0xF,
-        0,
-        "the translation mode reads back as Bare"
-    );
+    assert_eq!(recorded, "00000000", "{}", lines[2]);
 }
 
 #[test]

@@ -10,7 +10,7 @@
 //!   [`Csr::required_privilege`]; the check itself belongs to the CPU, which
 //!   knows the current mode.
 //! - **Read-only CSRs**: writes to the machine-information registers, to `misa`,
-//!   to `mip`, and to anything whose address has `csr[11:10] == 0b11` are
+//!   and to anything whose address has `csr[11:10] == 0b11` are
 //!   discarded. The Zicsr instructions trap instead where the architecture
 //!   requires it (see `cpu::execute_csr`); discarding here keeps the store
 //!   consistent no matter who calls it.
@@ -20,8 +20,8 @@
 //!
 //! # S-mode aliases
 //!
-//! `sstatus` and `sie` are not separate registers: they are narrower views onto
-//! `mstatus` and `mie`, which share storage. Writing through an alias therefore
+//! `sstatus`, `sie`, and `sip` are narrower views onto `mstatus`, `mie`, and
+//! `mip`. Interrupt views expose only bits delegated in `mideleg`. Writing through an alias therefore
 //! updates only the fields that alias can see and leaves the rest alone, which
 //! is what the architecture requires.
 //!
@@ -47,6 +47,7 @@ pub mod addr {
     // Supervisor trap/status.
     pub const SSTATUS: u32 = 0x100;
     pub const SIE: u32 = 0x104;
+    pub const SIP: u32 = 0x144;
     pub const STVEC: u32 = 0x105;
     pub const SSCRATCH: u32 = 0x140;
     pub const SEPC: u32 = 0x141;
@@ -71,6 +72,8 @@ pub mod addr {
     // Machine trap/status.
     pub const MSTATUS: u32 = 0x300;
     pub const MISA: u32 = 0x301;
+    pub const MEDELEG: u32 = 0x302;
+    pub const MIDELEG: u32 = 0x303;
     pub const MIE: u32 = 0x304;
     pub const MTVEC: u32 = 0x305;
     pub const MSCRATCH: u32 = 0x340;
@@ -97,6 +100,8 @@ pub const MSTATUS_SPIE: u32 = 1 << 5;
 pub const MSTATUS_MPIE: u32 = 1 << 7;
 /// `mstatus.SPP` — previous privilege for `sret`. One bit: U or S, never M.
 pub const MSTATUS_SPP: u32 = 1 << 8;
+/// Intercept SRET in S-mode; M-mode can still execute it.
+pub const MSTATUS_TSR: u32 = 1 << 22;
 /// `mstatus.MPP` — previous privilege for `mret`. Two bits, so it can hold M.
 pub const MSTATUS_MPP_SHIFT: u32 = 11;
 pub const MSTATUS_MPP: u32 = 0b11 << MSTATUS_MPP_SHIFT;
@@ -107,17 +112,20 @@ pub const MSTATUS_MPP: u32 = 0b11 << MSTATUS_MPP_SHIFT;
 const SSTATUS_MASK: u32 = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP;
 
 /// Bits of `mstatus` this model stores; everything else reads as zero.
-const MSTATUS_WRITABLE: u32 =
-    MSTATUS_SIE | MSTATUS_MIE | MSTATUS_SPIE | MSTATUS_MPIE | MSTATUS_SPP | MSTATUS_MPP;
+const MSTATUS_WRITABLE: u32 = MSTATUS_SIE
+    | MSTATUS_MIE
+    | MSTATUS_SPIE
+    | MSTATUS_MPIE
+    | MSTATUS_SPP
+    | MSTATUS_MPP
+    | MSTATUS_TSR;
 
-/// The machine interrupt bits: MSIP (3), MTIP (7) and MEIP (11). Only the
-/// machine sources exist, so `sie` carries the same three and `mip` reports the
-/// subset the controller asserts.
-///
-/// `MEIP` belongs to a PLIC, which this model does not have, so it is never
-/// actually raised. It is listed because `mie` permits enabling it, and a bit
-/// that could be enabled but never set would be a quiet lie in the CSR file.
-const INTERRUPT_MASK: u32 = (1 << 11) | (1 << 7) | (1 << 3);
+/// Supervisor pending bits. M-mode can inject all three; S-mode can write
+/// only SSIP, and only when it has been delegated.
+pub const SUPERVISOR_INTERRUPTS: u32 = (1 << 1) | (1 << 5) | (1 << 9);
+const INTERRUPT_MASK: u32 = (1 << 3) | (1 << 7) | (1 << 11) | SUPERVISOR_INTERRUPTS;
+/// Exceptions this model can delegate. M-mode ECALL (11) cannot be delegated.
+const EXCEPTION_DELEGATION_MASK: u32 = 0x3ff;
 
 /// `mcountinhibit` implements CY (bit 1) and IR (bit 2). The rest are reserved.
 const MCOUNTINHIBIT_WRITABLE: u32 = (1 << 1) | (1 << 2);
@@ -125,10 +133,6 @@ const MCOUNTINHIBIT_WRITABLE: u32 = (1 << 1) | (1 << 2);
 /// `mepc` and `sepc` hold an instruction address; with IALIGN = 32 the low two
 /// bits are always zero.
 const EPC_MASK: u32 = !0b11;
-
-/// `satp` mode field position and the only mode this model can represent.
-const SATP_MODE_SHIFT: u32 = 0;
-const SATP_MODE_BARE: u32 = 0;
 
 /// A sparse CSR register file with architectural field semantics.
 #[derive(Debug, Default)]
@@ -157,6 +161,7 @@ impl Csr {
                 // Supervisor.
                 | addr::SSTATUS
                 | addr::SIE
+                | addr::SIP
                 | addr::STVEC
                 | addr::SSCRATCH
                 | addr::SEPC
@@ -170,6 +175,8 @@ impl Csr {
                 | addr::MHARTID
                 | addr::MSTATUS
                 | addr::MISA
+                | addr::MEDELEG
+                | addr::MIDELEG
                 | addr::MIE
                 | addr::MTVEC
                 | addr::MSCRATCH
@@ -211,9 +218,8 @@ impl Csr {
 
     /// Read a CSR, applying the register's read mask. Unwritten CSRs read as 0.
     ///
-    /// `mip` is the one register whose value the CPU does not own: it belongs to
-    /// the interrupt controller. This returns the masked latch, and
-    /// [`crate::cpu::Cpu`] substitutes the live value when servicing a read.
+    /// For `mip`/`sip`, this returns the software-writable pending bits.
+    /// [`crate::cpu::Cpu`] ORs them with the live device signals on a CSR read.
     ///
     /// The caller performs the privilege check, so an access from too low a level
     /// is reported as an illegal instruction rather than as a read of state that
@@ -223,7 +229,11 @@ impl Csr {
         match csr {
             // Fixed-value registers.
             addr::MISA => MISA_VALUE,
-            addr::MIP => raw & INTERRUPT_MASK,
+            addr::MIP => raw & SUPERVISOR_INTERRUPTS,
+            addr::SIP => raw & self.read(addr::MIDELEG),
+            addr::SIE => raw & self.read(addr::MIDELEG),
+            addr::MEDELEG => raw & EXCEPTION_DELEGATION_MASK,
+            addr::MIDELEG => raw & SUPERVISOR_INTERRUPTS,
             // No NMI source exists, so this is constantly zero however it is
             // written. Reporting it as a register that exists but does nothing
             // is what lets software feature-detect instead of trapping.
@@ -253,7 +263,6 @@ impl Csr {
             // Constant registers: writes are ignored, which is a legal WARL
             // outcome rather than a fault.
             addr::MISA
-            | addr::MIP
             | addr::MNSTATUS
             | addr::MVENDORID
             | addr::MARCHID
@@ -266,12 +275,22 @@ impl Csr {
         let previous = self.data.get(&slot).copied().unwrap_or(0);
         let merged = match csr {
             addr::SSTATUS => previous & !SSTATUS_MASK | (val & SSTATUS_MASK),
-            addr::SIE => previous & !INTERRUPT_MASK | (val & INTERRUPT_MASK),
+            addr::SIE => {
+                let mask = self.read(addr::MIDELEG);
+                previous & !mask | (val & mask)
+            }
+            addr::SIP => {
+                let mask = self.read(addr::MIDELEG) & (1 << 1);
+                previous & !mask | (val & mask)
+            }
             _ => val,
         };
         let stored = match slot {
             addr::MSTATUS => legalize_mstatus(merged),
             addr::MIE => merged & INTERRUPT_MASK,
+            addr::MIP => merged & SUPERVISOR_INTERRUPTS,
+            addr::MEDELEG => merged & EXCEPTION_DELEGATION_MASK,
+            addr::MIDELEG => merged & SUPERVISOR_INTERRUPTS,
             addr::MTVEC | addr::STVEC => legalize_vector(merged),
             addr::MEPC | addr::SEPC => merged & EPC_MASK,
             addr::SATP => legalize_satp(merged),
@@ -282,9 +301,8 @@ impl Csr {
 
     /// The `mip` bits this machine can ever report.
     ///
-    /// Software cannot write `mip` — every bit belongs to an interrupt
-    /// controller — so this is the mask the CPU applies to the value it collects
-    /// from the address space.
+    /// The CPU applies this mask to signals collected from the address space.
+    /// Software-injected supervisor interrupts are stored separately.
     pub fn mip_mask() -> u32 {
         INTERRUPT_MASK
     }
@@ -292,12 +310,13 @@ impl Csr {
 
 /// Where a CSR's bits actually live.
 ///
-/// `sstatus` and `sie` are windows onto the machine registers rather than
+/// `sstatus`, `sie`, and `sip` are windows onto the machine registers rather than
 /// registers in their own right; everything else has dedicated storage.
 fn storage_for(csr: u32) -> u32 {
     match csr {
         addr::SSTATUS => addr::MSTATUS,
         addr::SIE => addr::MIE,
+        addr::SIP => addr::MIP,
         other => other,
     }
 }
@@ -324,16 +343,8 @@ fn legalize_vector(raw: u32) -> u32 {
     (raw & !0b11) | mode
 }
 
-/// Legalize `satp`.
-///
-/// This model does no address translation, so only Bare is representable. A
-/// write naming Sv39 or any other mode reads back as Bare rather than leaving a
-/// mode set that would silently do nothing — which would be a trapdoor for
-/// software that checks `satp` before trusting a pointer.
-fn legalize_satp(raw: u32) -> u32 {
-    if (raw >> SATP_MODE_SHIFT) & 0b1111 == SATP_MODE_BARE {
-        raw
-    } else {
-        raw & !(0b1111 << SATP_MODE_SHIFT)
-    }
+/// This RV32 model implements only Bare, with no ASIDs or page-table root.
+/// Unsupported Sv32 writes are ignored; all representable state reads as zero.
+fn legalize_satp(_raw: u32) -> u32 {
+    0
 }
