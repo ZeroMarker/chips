@@ -46,6 +46,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+      - name: Differential runner regression tests
+        run: python3 -m unittest discover -s scripts/tests -v
+
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 

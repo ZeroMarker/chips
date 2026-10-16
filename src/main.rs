@@ -17,24 +17,29 @@
 //!   format `docs/ARCHITECTURE.md` specifies. Intended for differential testing,
 //!   so the state dump is suppressed rather than interleaved.
 //!
+//! - `--stop-pc=ADDR`: stop before executing this address; fail if not reached.
+//! - `--state-log=FILE`: write independent `s1` snapshots initially and after
+//!   every attempted step, including trap entry, without advancing the CPU.
+//!
 //! A program halts itself with `ecall`/`ebreak` when no trap handler is
 //! installed; a trap is reported with its `mcause`/`mtval` and a nonzero exit
 //! code.
 
-use chips::cpu::Cpu;
+use chips::cpu::{Cpu, StepOutcome, StopReason};
 use chips::csr::addr as csr_addr;
 use chips::htif::Outcome;
 use chips::isa::reg_name;
 use chips::mem::Memory;
 use chips::platform;
 use chips::trace::TextTrace;
+use std::io::Write;
 use std::process::ExitCode;
 
 const DEFAULT_START: u32 = 0x8000_0000;
 const DEFAULT_BUDGET: u64 = 10_000_000;
 
 const USAGE: &str = "usage: chips <image.bin> [start_addr] [max_instructions] \
-                   [--htif[=tohost_addr]] [--trace]";
+                   [--htif[=tohost_addr]] [--trace] [--stop-pc=ADDR] [--state-log=FILE]";
 
 fn parse_u32(s: &str) -> Result<u32, String> {
     let clean = s.trim_start_matches("0x").trim_start_matches("0X");
@@ -70,8 +75,24 @@ fn main() -> ExitCode {
     let mut tohost = platform::riscv_tests::TOHOST;
     let mut htif_mode = false;
     let mut trace = false;
+    let mut stop_pc = None;
+    let mut state_path = None;
     let mut positional: Vec<&String> = Vec::new();
     for arg in &args[1..] {
+        if let Some(value) = arg.strip_prefix("--stop-pc=") {
+            match parse_u32(value) {
+                Ok(address) => stop_pc = Some(address),
+                Err(error) => {
+                    eprintln!("error: --stop-pc: {error}");
+                    return ExitCode::from(2);
+                }
+            }
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--state-log=") {
+            state_path = Some(value);
+            continue;
+        }
         if arg == "--trace" {
             trace = true;
             continue;
@@ -126,8 +147,19 @@ fn main() -> ExitCode {
         None => DEFAULT_BUDGET,
     };
 
+    if htif_mode && stop_pc.is_some() {
+        eprintln!("error: --stop-pc and --htif cannot be combined");
+        return ExitCode::from(2);
+    }
+    let mut state_log = match state_path.map(std::fs::File::create).transpose() {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("error: cannot create state log: {error}");
+            return ExitCode::from(2);
+        }
+    };
     if htif_mode {
-        return run_htif(&bytes, base, budget, tohost, trace);
+        return run_htif(&bytes, base, budget, tohost, trace, &mut state_log);
     }
 
     let mut mem = Memory::permissive();
@@ -146,10 +178,48 @@ fn main() -> ExitCode {
     cpu.set_pc(base);
     attach_trace(&mut cpu, trace);
 
-    match cpu.run(&mut mem, budget) {
+    if !record_state(&cpu, &mut state_log) {
+        return ExitCode::from(2);
+    }
+    let mut result = Ok(StopReason::Limit);
+    for _ in 0..budget {
+        if stop_pc == Some(cpu.pc()) {
+            break;
+        }
+        let step = cpu.step(&mut mem);
+        if !record_state(&cpu, &mut state_log) {
+            return ExitCode::from(2);
+        }
+        match step {
+            Ok(StepOutcome::Continue | StepOutcome::TrapTaken) => {}
+            Ok(StepOutcome::Ecall) => {
+                result = Ok(StopReason::Ecall);
+                break;
+            }
+            Ok(StepOutcome::Ebreak) => {
+                result = Ok(StopReason::Ebreak);
+                break;
+            }
+            Err(trap) => {
+                result = Err(trap);
+                break;
+            }
+        }
+    }
+    if stop_pc.is_some() && stop_pc != Some(cpu.pc()) && result.is_ok() {
+        eprintln!("FAIL: checkpoint not reached within {budget} steps");
+        return ExitCode::from(1);
+    }
+    match result {
         Ok(reason) => {
-            println!("stopped: {reason:?}");
-            dump_state(&cpu);
+            if !trace {
+                if stop_pc == Some(cpu.pc()) {
+                    println!("stopped: Checkpoint");
+                } else {
+                    println!("stopped: {reason:?}");
+                }
+                dump_state(&cpu);
+            }
             ExitCode::SUCCESS
         }
         Err(trap) => {
@@ -161,19 +231,14 @@ fn main() -> ExitCode {
             );
             eprintln!("  mtval=0x{:08x}", trap.mtval());
             eprintln!("  no trap handler was installed (mtvec = 0), so the run stopped here");
-            dump_state(&cpu);
+            if !trace {
+                dump_state(&cpu);
+            }
             ExitCode::from(1)
         }
     }
 }
 
-/// Run an image on the `riscv-tests` platform and report what it wrote to
-/// `tohost`.
-///
-/// The suites do not halt: they write a completion code and then spin. So this
-/// drives [`Cpu::step`] itself and checks the device after every instruction,
-/// which also means the run stops the instant the result lands rather than
-/// burning the remaining budget.
 /// Attach a stdout trace if `trace` was requested.
 fn attach_trace(cpu: &mut Cpu, trace: bool) {
     if trace {
@@ -181,7 +246,24 @@ fn attach_trace(cpu: &mut Cpu, trace: bool) {
     }
 }
 
-fn run_htif(bytes: &[u8], base: u32, budget: u64, tohost: u32, trace: bool) -> ExitCode {
+fn record_state(cpu: &Cpu, log: &mut Option<std::fs::File>) -> bool {
+    if let Some(file) = log {
+        if let Err(error) = writeln!(file, "{}", cpu.state_line()) {
+            eprintln!("error: cannot write state log: {error}");
+            return false;
+        }
+    }
+    true
+}
+
+fn run_htif(
+    bytes: &[u8],
+    base: u32,
+    budget: u64,
+    tohost: u32,
+    trace: bool,
+    state_log: &mut Option<std::fs::File>,
+) -> ExitCode {
     let (mut mem, htif, _clint) = platform::riscv_tests(tohost);
     if let Err(fault) = mem.load_image(base, bytes) {
         eprintln!(
@@ -198,8 +280,15 @@ fn run_htif(bytes: &[u8], base: u32, budget: u64, tohost: u32, trace: bool) -> E
     cpu.set_pc(base);
     attach_trace(&mut cpu, trace);
 
+    if !record_state(&cpu, state_log) {
+        return ExitCode::from(2);
+    }
     for step in 1..=budget {
-        let outcome = match cpu.step(&mut mem) {
+        let executed = cpu.step(&mut mem);
+        if !record_state(&cpu, state_log) {
+            return ExitCode::from(2);
+        }
+        let outcome = match executed {
             Ok(_) => htif.outcome(),
             Err(trap) => {
                 eprintln!(
@@ -210,18 +299,25 @@ fn run_htif(bytes: &[u8], base: u32, budget: u64, tohost: u32, trace: bool) -> E
                     trap_cause_name(trap.mcause())
                 );
                 eprintln!("  mtval=0x{:08x}", trap.mtval());
-                dump_state(&cpu);
+                if !trace {
+                    dump_state(&cpu);
+                }
                 return ExitCode::from(1);
             }
         };
 
         if outcome.is_final() {
+            if trace && outcome == Outcome::Pass {
+                return ExitCode::SUCCESS;
+            }
             return report_htif(&cpu, outcome, step);
         }
     }
 
     eprintln!("FAIL: no result in tohost after {budget} instructions");
-    dump_state(&cpu);
+    if !trace {
+        dump_state(&cpu);
+    }
     ExitCode::from(1)
 }
 

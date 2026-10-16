@@ -193,6 +193,23 @@ impl Cpu {
         }
     }
 
+    /// Host-side architectural snapshot, independent of the change trace.
+    /// Reads do not advance counters or execute guest CSR privilege checks.
+    /// All implemented CSRs are included; consumers choose comparable fields.
+    pub fn state_line(&self) -> String {
+        use std::fmt::Write;
+        let mut line = format!("s1 pc={:08x} priv={}", self.pc, self.privilege.encoding());
+        for index in 0..32 {
+            let _ = write!(line, " x{index}={:08x}", self.reg(index));
+        }
+        for address in 0..0x1000 {
+            if Csr::exists(address) {
+                let _ = write!(line, " c{address:03x}={:08x}", self.read_csr(address));
+            }
+        }
+        line
+    }
+
     /// Current program counter.
     pub fn pc(&self) -> u32 {
         self.pc

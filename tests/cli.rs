@@ -194,3 +194,153 @@ fn reports_a_missing_image() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("cannot read"));
 }
+
+#[test]
+fn checkpoint_stops_before_execution_and_records_independent_states() {
+    let path = image("checkpoint", &[li(5, 42), li(6, 99), ebreak()]);
+    let log = path.with_extension("state");
+    let out = run(&[
+        path.to_str().unwrap(),
+        "0x1000",
+        "1",
+        "--trace",
+        "--stop-pc=0x1004",
+        &format!("--state-log={}", log.display()),
+    ]);
+    assert!(out.status.success(), "{:?}", out);
+    let trace = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        trace.lines().count(),
+        2,
+        "version and one retired step only"
+    );
+    assert!(trace.starts_with("v1\ni 1 "));
+    let text = std::fs::read_to_string(&log).unwrap();
+    let states: Vec<_> = text.lines().collect();
+    assert_eq!(states.len(), 2, "initial and post-step states");
+    assert!(states[0].contains("pc=00001000 priv=3"));
+    assert!(states[0].contains("x5=00000000"));
+    assert!(states[1].contains("pc=00001004 priv=3"));
+    assert!(states[1].contains("x5=0000002a x6=00000000"));
+    assert!(
+        states[1].contains("cb00=00000001"),
+        "observation does not tick counters"
+    );
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(log);
+}
+
+#[test]
+fn checkpoint_at_entry_needs_no_steps_even_with_zero_budget() {
+    let path = image("entry-checkpoint", &[li(5, 42)]);
+    let out = run(&[path.to_str().unwrap(), "0x1000", "0", "--stop-pc=4096"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("stopped: Checkpoint"));
+    assert_eq!(reg(&stdout, 5), "00000000");
+    assert_eq!(counter_line(&stdout), "cycle = 0  instret = 0  time = 0");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn unreached_checkpoint_fails_on_budget_or_early_halt() {
+    for (name, word) in [
+        ("spin-checkpoint", jal(0, 0)),
+        ("halt-checkpoint", ebreak()),
+    ] {
+        let path = image(name, &[word]);
+        let out = run(&[path.to_str().unwrap(), "0x1000", "2", "--stop-pc=0x2000"]);
+        assert_eq!(out.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("checkpoint not reached"));
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[test]
+fn failed_step_records_trap_state_without_polluting_trace() {
+    let path = image("trap-state", &[0xffff_ffff]);
+    let log = path.with_extension("state");
+    let out = run(&[
+        path.to_str().unwrap(),
+        "0x1000",
+        "1",
+        "--trace",
+        &format!("--state-log={}", log.display()),
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 2);
+    assert!(stdout.starts_with("v1\nt 1 "));
+    let states = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(states.lines().count(), 2);
+    let last = states.lines().last().unwrap();
+    assert!(last.contains("c341=00000000 c342=00000000 c343=00000000"));
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(log);
+}
+
+#[test]
+fn state_log_observations_do_not_change_execution() {
+    let path = image("observer", &[li(5, 7), addi(5, 5, 1), ebreak()]);
+    let log = path.with_extension("state");
+    let plain = run(&[path.to_str().unwrap(), "0x1000"]);
+    let observed = run(&[
+        path.to_str().unwrap(),
+        "0x1000",
+        &format!("--state-log={}", log.display()),
+    ]);
+    assert!(plain.status.success() && observed.status.success());
+    assert_eq!(plain.stdout, observed.stdout);
+    assert_eq!(plain.stderr, observed.stderr);
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(log);
+}
+
+#[test]
+fn invalid_state_log_destination_is_a_usage_error() {
+    let path = image("bad-state-path", &[ebreak()]);
+    let out = run(&[
+        path.to_str().unwrap(),
+        &format!("--state-log={}", std::env::temp_dir().display()),
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot create state log"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn checkpoint_and_htif_cannot_silently_override_each_other() {
+    let path = image("conflicting-stops", &[ebreak()]);
+    let out = run(&[path.to_str().unwrap(), "--htif", "--stop-pc=0x1000"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot be combined"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn delivered_trap_snapshot_includes_implicit_csr_changes() {
+    let path = image(
+        "delivered-state",
+        &[li(5, 0x100), csrrw(0x305, 5, 0), 0xffff_ffff],
+    );
+    let log = path.with_extension("state");
+    let out = run(&[
+        path.to_str().unwrap(),
+        "0x1000",
+        "3",
+        "--trace",
+        "--stop-pc=0x100",
+        &format!("--state-log={}", log.display()),
+    ]);
+    assert!(out.status.success(), "{:?}", out);
+    let trace = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(trace.lines().count(), 4);
+    assert!(trace.lines().last().unwrap().starts_with("t 3 "));
+    let states = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(states.lines().count(), 4);
+    let last = states.lines().last().unwrap();
+    assert!(last.contains("pc=00000100 priv=3"));
+    assert!(last.contains("c341=00001008 c342=00000002 c343=ffffffff"));
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(log);
+}

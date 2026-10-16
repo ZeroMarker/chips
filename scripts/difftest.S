@@ -29,6 +29,11 @@
     .globl _start
     .align 6
 _start:
+    /* Establish the same PMP baseline on both simulator platforms. */
+    csrw    pmpcfg0, zero
+    csrw    pmpaddr0, zero
+    .globl difftest_start
+difftest_start:
     /* Install the trap handler first, so an unexpected trap is reported rather
      * than looping. The handler is a distinct check number from any real failure,
      * which is what lets a mismatch say "a trap happened" instead of "a value was

@@ -218,7 +218,7 @@ CSR 的正确性集中在三件事，缺一不可。
 
 CPU 在取指和每次 load/store 调用后备内存之前检查 PMP。MPRV=1 时数据访问使用 MPP 特权，取指始终使用当前特权。拒绝返回对应访问故障，保留原始指令/数据地址作为 tval，并复用 M/S 陷阱路由。模型将非对齐数据指令视作一次完整操作，跨项拒绝时不产生部分写入或 MMIO 调用。区域权限仍须通过，PMP 放行不会绕过地址映射。
 
-`tests/pmp.rs` 覆盖权限、边界、锁定和 MPRV。官方 `pmpaddr` 在 G=0 时只走寄存器探测路径；额外 `scripts/pmp.S` 通过执行与故障处理检查隔离，103 步程序与 Spike 一致（只比较现有 harness 的退休记录交集）。
+`tests/pmp.rs` 覆盖权限、边界、锁定和 MPRV。官方 `pmpaddr` 在 G=0 时只走寄存器探测路径；额外 `scripts/pmp.S` 通过执行与故障处理检查隔离，103 步程序与 Spike 一致（含逐步寄存器与 CSR 状态）。
 
 ### 原生地址触发器
 
@@ -301,16 +301,37 @@ x <step> pc=<8 hex> inst=<8 hex> [...]
 
 ## 11. 与 Spike 的差分
 
-`scripts/difftest.sh` 在同一程序上分别跑模型与 Spike，逐步比较两者都报告的交集：**PC、指令字、目的寄存器与其值、内存写入的地址与值**。只比较**已退休**的指令——Spike 的提交日志仅记录这些；陷阱仍然可见，因为处理程序的第一条指令会以处理程序地址作为下一条已退休步骤出现。
+`scripts/difftest.sh` 调用 Python 标准库 runner `scripts/difftest.py`，默认构建并运行通用、PMP、触发器及委派四组探针。它同时比较退休指令效果与独立读取的真实状态，不从提交日志推算快照。
 
-两处必须留在比较范围之外，都是「架构未规定」而非缺陷：
+模型 `--state-log=FILE` 写入初始状态及每次 `Cpu::step` 后的状态，包括未退休的陷阱步骤。`Cpu::state_line()` 只观察 CPU，不推进计数器，不执行客体 CSR 指令，也不触发特权检查。格式为一行一个快照：
 
-- **非对齐数据访问**。Spike 抛地址未对齐异常，模型完成访问（`riscv-tests` 的 `ma_data` 与真实硬件都要求拿到值）。两者都合规，而一条分歧指令会使其后每一条都错位。模型的期望值由官方套件断言。
-- **取值由实现决定的寄存器**。`misa` 报告该实现提供的扩展（Spike 声明模型没有的 U 与 X），计数器在各自机器上没有意义。`misa` 的期望值由模型自己的测试逐字钉住。
+```text
+s1 pc=<8 hex> priv=<0|1|3> x0=<8 hex> ... x31=<8 hex> c100=<8 hex> ...
+```
 
-`scripts/difftest.S` 因此是一个**自带**的探针程序，而不是任何套件成员：官方测试的序言会探测可选 CSR，两侧实现子集不同，可能在真实运算前就走出不同路径。harness 把落在可选 CSR 上的分歧归类为 gap 而非发现。
+`c` 后是三位十六进制 CSR 地址；按地址递增，列出 `Csr::exists()` 登记的所有 CSR，计数器/时间/pending 通过 CPU 的实时读取路径取得。触发器窗口反映当前 `tselect`，不是所有槽位的展开。日志独立于 `v1` 写入 trace，二者均开启时 stdout 只含 `v1` trace。
 
-终止不通过 HTIF：Spike 内建 HTIF 与 `riscv-tests` 的 `tohost` 协议不同，且代理内核 `pk` 已从 riscv-isa-sim 移除，没有哪个 `tohost` 取值能让两侧都正确结束。程序改为停在 `pass_spin` 或 `fail_spin`，harness 从最终 PC 读出结论。
+Spike 通过 `-d --debug-cmd` 执行相同步数的 `rs 1`，每步分别查询 PC、特权级、32 个整数寄存器和 40 个 CSR。包括陷阱进入后的快照都必须对应；最终快照也参与比较。退休记录另外核对 PC、指令字、寄存器写入和内存写入。Spike 提交日志**包含显式 CSR 写入**，旧版文档称其不记录 CSR 是错误的；但陷阱入口没有对应退休记录，且同值写入及别名的日志形式可不同，因此 harness 解析 CSR token，比较其逐步真实状态效果，不要求文本写入序列一致。
+
+共有字段由 `scripts/difftest.py::CSRS` 固定，掩码之外不宣称一致：
+
+| CSR | 比较掩码 / 范围 |
+|---|---|
+| `sstatus` / `sie` | `0x122` / `0x222` |
+| `mstatus` | `0x4219aa`：已实现的中断栈、MPP、MPRV、TSR |
+| `medeleg` / `mideleg` / `mie` | `0x3ff` / `0x222` / `0xaaa` |
+| `stvec`、`sscratch`、`sepc`、`scause`、`stval`、`satp` | 全 32 位 |
+| `mtvec`、`mscratch`、`mepc`、`mcause`、`mtval` | 全 32 位 |
+| `pmpcfg0..3` / `pmpaddr0..15` | 每项合法配置位 `0x9f9f9f9f` / 32 位物理地址域 `0x3fffffff` |
+| `tselect` / `tdata2` / `tdata1` | 全 32 位 / 全 32 位 / 基础 M/S/U 与 R/W/X 位 `0x5f` |
+
+不比较计数器、时间、设备 pending、标识/能力 CSR、触发器 type/hit 等实现差异。`tdata1/2` 只读当前选中槽，探针通过切换 `tselect` 检查两个槽。非对齐数据访问在模型完成、Spike 陷阱，故探针避开此项；模型的结果由官方套件断言。
+
+Spike reset 默认把 PMP 第零项设为全放行，模型默认全 OFF。四组探针先执行 `csrw pmpcfg0, zero` 和 `csrw pmpaddr0, zero`，再从显式符号 `difftest_start` 开始比较全部状态。这两条初始化指令仍参与退休记录比较；没有该符号的自定义 ELF 从复位状态开始比对，不隐藏默认 PMP 差异。
+
+模型 `--stop-pc` 在执行成功地址前停止；未到达目标则失败。Spike 严格执行相同步数再正常退出，程序不执行末尾自旋。任意非零退出、超时、状态读取缺失、多余数据、退休记录数量不同或状态分歧均失败，不再将可选 CSR 分歧归类为 gap。`--timeout` 默认每个命令 30 秒；`--budget` 默认 2000 步。13 个 Python 回归在 CI 验证解析、长度检查及故障路径；实际 Spike 差分尚未成为 CI 门禁。
+
+当前四组分别执行 225 / 103 / 105 / 53 步，退休 224 / 100 / 101 / 51 条，比较 224 / 102 / 104 / 52 个状态（从两条 PMP 初始化后的状态开始，含最终状态）。新增 `delegation.S` 验证 U→S 委派 ECALL、嵌套 S→M ECALL，以及 MRET/SRET 返回 U。
 
 ## 12. 已知限制
 
@@ -319,7 +340,7 @@ x <step> pc=<8 hex> inst=<8 hex> [...]
 1. **原生触发器仅实现基础地址匹配**。`breakpoint`、`pmpaddr`、`illegal` 已全部纳入门禁，但外部调试、type-6 与高级触发功能未实现；PMP 的 Smepmp 增强也未实现。
 2. **无地址转换**。仅 Bare，`satp`/TVM/SUM/MXR 读零；选择不实现 `SFENCE.VMA` 并产生非法指令异常。引入 Sv32 时需要配套页表遍历、权限和 TVM 门控。
 3. **无 PLIC**。平台目前只有 CLINT，尚无外部中断控制器；S 级外部/定时器中断可由 M 软件注入。
-4. **差分比较不含 CSR 写入与完整最终状态**。新委派路径由定向回归与官方 `illegal` 测试验证，现有 225 步通用、103 步 PMP 与 105 步触发器探针仍不提供这部分完整差分覆盖。
+4. **差分尚无随机流及全部状态覆盖**。四组定向探针已核对每步完整整数寄存器与 40 个 CSR 的共有字段；计数器、设备 pending、能力字段及所有触发器槽的同时快照尚未纳入。Spike 固定版本构建与缓存仍待实现。
 
 本次特权语义依据固定版本的官方手册：[Machine-Level ISA v1.13](https://docs.riscv.org/reference/isa/v20260120/priv/machine.html)（委派、中断、TSR、PMP 与 MPRV）及 [Supervisor-Level ISA v1.13](https://docs.riscv.org/reference/isa/v20260120/priv/supervisor.html)（CSR 视图、Bare 与 SFENCE.VMA）。
 

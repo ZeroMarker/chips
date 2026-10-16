@@ -8,6 +8,11 @@
     .section .text.init
     .globl _start
 _start:
+    /* Establish the same PMP baseline on both simulator platforms. */
+    csrw    pmpcfg0, zero
+    csrw    pmpaddr0, zero
+    .globl difftest_start
+difftest_start:
     la t0, trap_handler
     csrw mtvec, t0
     li t4, 0                   /* number of expected traps */

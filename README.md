@@ -6,7 +6,7 @@
 
 模型已接入官方 **`riscv-tests`** 一致性套件：`rv32ui-p-*` 与 `rv32mi-p-*` 共 58 个测试中 **58 个通过**，**0 失败、0 排除、0 跳过**（详见下文）。
 
-模型同时接入 **Spike 差分测试**：`scripts/difftest.sh` 在同一程序上逐步比较 PC、指令字、目的寄存器与其值、内存写入的地址与值。当前通用 225 步、PMP 103 步与触发器 105 步探针程序均两侧一致，尚未覆盖随机指令流、CSR 写入与完整最终架构状态。
+模型同时接入 **Spike 差分测试**：四组探针逐步比较退休指令与内存写入，并独立读取 PC、特权级、全部 32 个整数寄存器及 40 个 CSR 的共有字段，覆盖陷阱入口及最终状态。尚未覆盖随机指令流和全部 CSR 能力。
 
 - 目标配置：`RV32IMC` 起步（当前 `RV32IMZicsr`，`C` 扩展待做）
 - 特权级：M / S / U；支持 `medeleg`/`mideleg` 陷阱委派与 S 级中断，地址翻译仅支持 Bare
@@ -18,9 +18,9 @@
 
 | 本地检查 | 结果 |
 |----------|------|
-| Rust 测试（debug / release） | 每种 profile 均为 174 通过、0 失败 |
+| Rust 测试（debug / release） | 每种 profile 均为 182 通过、0 失败 |
 | 官方选定套件（`rv32ui-p-*` / `rv32mi-p-*`） | 58 通过、0 失败、0 排除、0 跳过 |
-| Spike 探针 | 通用 225 步、PMP 103 步、触发器 105 步均一致；含自旋分别比较 1999 / 1997 / 1996 条退休记录 |
+| Spike 探针 | 通用 / PMP / 触发器 / 委派：225 / 103 / 105 / 53 步，全部一致；不计末尾自旋 |
 | 交叉工具链冒烟测试 | 通过 |
 | 格式、Clippy、rustdoc | 通过 |
 
@@ -57,7 +57,7 @@ cargo test --all-targets
 cargo test --release --all-targets    # release 关闭溢出检查，结果必须一致
 ```
 
-174 个测试，分布在：
+182 个测试，分布在：
 
 | 测试文件 | 数量 | 覆盖内容 |
 |----------|------|----------|
@@ -73,7 +73,9 @@ cargo test --release --all-targets    # release 关闭溢出检查，结果必�
 | `tests/privilege.rs` | 22 | M/S/U 转换、`ecall` 原因码、`mret`/`sret`、CSR 特权判定、别名 |
 | `tests/trace.rs` | 23 | trace 格式的逐字文本，以及「挂 trace 不改变执行」 |
 | `tests/architecture.rs` | 7 | 取指对齐、非对齐数据访问、计数器、保留编码 |
-| `tests/cli.rs` | 8 | 驱动层：参数、退出码、状态输出 |
+| `tests/cli.rs` | 16 | 驱动层：参数、退出码、检查点、独立状态快照与 trace 输出 |
+
+另有 13 个 Python harness 回归：`python3 -m unittest discover -s scripts/tests -v`，已接入 CI，无需 Spike 或交叉工具链。
 
 测试用手工编码的指令字（`tests/common/mod.rs` 提供编码器，避免手写位域出错）。`cargo test` 只跑 Rust 测试，**不**验证编译器产生的真实编码——那需要交叉工具链，由下面的冒烟测试与一致性套件负责。
 
@@ -135,11 +137,13 @@ misa = 0x40001100
 
 | 码 | 含义 |
 |----|------|
-| `0` | 正常停止：`Ecall`、`Ebreak`（程序自行停机）或 `Limit`（指令预算用尽） |
-| `1` | 发生陷阱且未安装处理程序，状态已转储到 stderr |
-| `2` | 用法错误，或镜像文件无法读取 |
+| `0` | 正常停止：`Ecall`、`Ebreak`、`Limit` 或到达指定检查点 |
+| `1` | 未处理陷阱、HTIF 失败或未到达指定检查点；诊断在 stderr |
+| `2` | 用法错误，或镜像 / 状态日志 I/O 失败 |
 
 未安装处理程序时 `ecall`/`ebreak` 结束运行循环——这正是裸机程序自行停机的方式。
+
+`--stop-pc=ADDR` 在执行指定地址之前停止；预算耗尽或提前停机却未到达该地址时返回 1，不能与 `--htif` 同用。`--state-log=FILE` 将初始状态及每次尝试执行后的实际状态写入独立文件，含陷阱进入；`--trace` 的 stdout 始终只含 trace。快照格式见架构文档 §11。
 
 ### `--htif` 模式
 
@@ -192,33 +196,25 @@ RISCV_TESTS_DIR=/path/to/tree scripts/riscv-tests.sh   # 复用已有克隆（�
 ```sh
 bash scripts/difftest.sh             # 缺 Spike 则 SKIP（exit 0）
 bash scripts/difftest.sh --require   # 缺 Spike 则失败
-bash scripts/difftest.sh -v          # 首次分歧的完整上下文
+bash scripts/difftest.sh -v          # 比较起点、检查点与超时配置
 SPIKE=/path/to/spike bash scripts/difftest.sh
 ```
 
-在同一程序上分别跑模型与 Spike，逐步比较**两者都报告的交集**：PC、指令字、目的寄存器与其值、内存写入的地址与值。只比较已退休的指令——Spike 的提交日志仅记录这些。
+默认构建并运行四组探针：通用指令 225 步、PMP 103 步、触发器 105 步、M/S/U 委派与嵌套陷阱 53 步；对应退休记录为 224 / 100 / 101 / 51 条。程序到达 `pass_spin` 即停止，不比较末尾自旋。四组逐步状态均一致。
 
-自带的探针程序是 `scripts/difftest.S`（**不是**任何套件成员）：官方测试的序言会探测可选 CSR，两侧实现的子集不同，可能在真实运算之前就走出不同路径。当前结果：**225 步程序，两侧完全一致**。
+harness 比较退休记录中的 PC、指令字、目的寄存器写入及内存写入，还通过模型 `--state-log` 和 Spike 调试器分别读取每步后的 PC、特权级、x0–x31 与 **40 个 CSR 的共有字段**。陷阱入口即使没有退休记录，其 `mepc`/`mcause`/`mtval` 和 S 级对应状态也被直接核对。CSR 写入同值或别名的文本记录不要求一一相同；比较的是实际逐步效果。掩码及边界见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §11。
 
-两处必须留在比较范围之外，都是「架构未规定」而非缺陷：**非对齐数据访问**（Spike 陷阱、模型完成，两者都合规）与**取值由实现决定的寄存器**（`misa` 报告扩展位，计数器只在各自机器上有意义）。详见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §11。
+需要 Python 3.10+ 标准库、Rust、交叉工具链和支持 `--debug-cmd`/`--log-commits` 的 Spike。运行超时、异常退出、日志缺失或任何分歧均失败，不再按可选 CSR 降级为 gap。`--budget` 限制模型步数，`--timeout` 限制每个外部命令的秒数（默认 30）。`-v` 显示比较起点与检查点。
 
-额外的 PMP 探针 [`scripts/pmp.S`](scripts/pmp.S) 覆盖 MPRV 读写、M 级未锁定绕过与锁定后拒绝、锁定 CSR 不可改写，以及 S 级访问故障后返回。103 步程序与 Spike 一致；它需显式指定，不属于默认 225 步探针：
+也可指定 ELF，默认检查 `pass_spin`；用 `--checkpoint=符号或地址` 指定其他成功检查点：
 
 ```sh
-mkdir -p target
 riscv64-unknown-elf-gcc -march=rv32im_zicsr -mabi=ilp32 -nostdlib -nostartfiles \
     -T scripts/difftest.ld -o target/pmp.elf scripts/pmp.S
 SPIKE=/path/to/spike bash scripts/difftest.sh --require target/pmp.elf
 ```
 
-额外的触发器探针 [`scripts/triggers.S`](scripts/triggers.S) 验证双触发器、执行/读/写断点、处理程序内抑制、MRET 恢复与 MIE 门控。105 步程序与 Spike 一致，按相同方式显式运行：
-
-```sh
-mkdir -p target
-riscv64-unknown-elf-gcc -march=rv32im_zicsr -mabi=ilp32 -nostdlib -nostartfiles \
-    -T scripts/difftest.ld -o target/triggers.elf scripts/triggers.S
-SPIKE=/path/to/spike bash scripts/difftest.sh --require target/triggers.elf
-```
+四个探针先显式清零 Spike 默认开放的 PMP 项，再从 `difftest_start` 开始比较状态；初始化指令仍参与退休记录比较。自定义 ELF 没有此符号时从初始状态开始核对，因此也会报告启动配置差异。非对齐数据访问、计数器与能力寄存器等实现差异仍须在程序设计时处理，不能要求两侧任意程序都一致。
 
 ## 端到端冒烟测试
 
@@ -258,7 +254,7 @@ scripts/riscv-smoke.sh --require    # 缺少工具链则失败——CI 用此模
 - 完整外部调试：JTAG/DMI、Debug Mode、单步尚未实现；原生触发器仅支持 type-2 地址等值匹配与执行前异常，无 `mcontrol6`、链式/数据值匹配、hit 位或上下文筛选
 - 可选 `tcontrol` 不存在；通过 MIE/SIE 门控支持原生断点。PMP 未实现 Smepmp 增强
 - PLIC（故 `MEIP` 永不被置起）、外设总线与 boot ROM
-- 差分比较不含 CSR 写入——Spike 提交日志不记录它们，不在交集内
+- 差分仅覆盖四组定向探针、40 个 CSR 的共有字段和当前选中触发器；随机流、计数器、设备 pending 与全部能力字段尚未纳入
 
 完整清单与优先级见 [`docs/TODO.md`](docs/TODO.md)。
 
