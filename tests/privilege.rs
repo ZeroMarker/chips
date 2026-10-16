@@ -40,6 +40,7 @@ fn machine_with_handler(words: &[u32]) -> (Cpu, chips::Memory) {
 /// installed by the time the body runs, which matters for the tests that expect
 /// a trap to be delivered.
 fn enter(cpu: &mut Cpu, mode: Privilege, target: u32) {
+    permit_all_memory(cpu);
     let [h1, h2] = li32(1, HANDLER);
     let [m1, m2] = li32(2, mode.encoding() << 11);
     let [t1, t2] = li32(3, target);
@@ -422,6 +423,7 @@ fn ecall_with_no_handler_still_halts_the_run() {
     // an ecall ends the loop whatever mode it came from.
     for mode in [Privilege::Machine, Privilege::Supervisor, Privilege::User] {
         let (mut cpu, mut mem) = machine(CODE, &[ecall()]);
+        permit_all_memory(&mut cpu);
         cpu.set_privilege(mode);
         assert_eq!(
             cpu.step(&mut mem),

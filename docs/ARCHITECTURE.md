@@ -23,6 +23,7 @@ src/
   isa.rs      ISA 常量、ABI 寄存器名、立即数解码、32 位译码
   cpu.rs      CPU 状态与执行循环（取指 → 译码 → 执行 → 陷阱）
   csr.rs      CSR 容器：地址表、只读判定、WARL 字段语义
+  pmp.rs      16 项物理内存保护：匹配、权限与锁定
   mem.rs      解码后的地址映射：区域、权限、访问故障、设备
   htif.rs     HTIF `tohost`/`fromhost` 测试完成协议
   platform.rs 预定义目标平台（`riscv-tests` 内存布局）
@@ -59,9 +60,9 @@ main ──▶ cpu ──▶ isa
 2. 向地址空间索取设备置起的 `mip`（`& Csr::mip_mask()`）与时间基；并让它推进时间基。**没有 CLINT 的地址空间**退回模型自己的每步计数器，因此指令级测试读 `time` 不会看到 0
 3. **中断检查**：合并设备信号与软件注入的 pending 位，按委派、源使能、当前特权和目标级全局使能交付；发生在取指前，目标级 EPC 指向没有执行的指令
 4. **取指对齐检查**：`pc & 0b11 != 0` → `InstructionAddressMisaligned`
-5. `mem.fetch_u32(pc)` 取指（4 字节小端），失败则 `InstructionAccessFault`
+5. 先按当前特权检查 PMP，再 `mem.fetch_u32(pc)` 取指（4 字节小端）；拒绝时 `InstructionAccessFault`，不读取后备设备
 6. `isa::decode()` 译码
-7. `execute()`：按 `opcode` 分派，产出 `StepOutcome`；访存失败产生对应的 `LoadAccessFault`/`StoreAccessFault`
+7. `execute()`：按 `opcode` 分派，产出 `StepOutcome`；数据访存先检查 PMP（含 MPRV），再访问内存，失败产生对应的 `LoadAccessFault`/`StoreAccessFault`
 8. 若正常退休且本指令**未写入** `minstret` 且 `mcountinhibit.IR` 未置位，`instret` 加一
 9. 若挂了 trace，构造一条 `Record` 并交给 sink
 
@@ -117,7 +118,7 @@ RV32 `xcause = 0x80000000 | 原因号`，`xtval = 0`。直接模式进入 `tvec 
 
 MRET 仅 M 可执行，返回 MPP 指定特权与 `mepc`；SRET 在 S/M 可执行，返回 SPP 指定特权与 `sepc`，TSR=1 时 S 级执行 SRET 陷阱，M 级不受此位限制。
 
-两者均执行 `xIE <- xPIE`、`xPIE <- 1`，并将 `xPP` 清为最低支持特权 U。测试覆盖 U→S→M 的嵌套进入与 MRET→SRET 返回路径。
+两者均执行 `xIE <- xPIE`、`xPIE <- 1`，并将 `xPP` 清为最低支持特权 U；返回低于 M 的模式时同时清除 MPRV。测试覆盖 U→S→M 的嵌套进入与 MRET→SRET 返回路径。
 
 ### `Trap` 枚举
 
@@ -170,7 +171,7 @@ CSR 的正确性集中在三件事，缺一不可。
 
 | CSR | 合法化规则 |
 |-----|-----------|
-| `mstatus` | 保留 `SIE`/`MIE`/`SPIE`/`MPIE`/`SPP`/`MPP`/`TSR`；`MPP` 支持 M/S/U，保留编码合法化为 U，其余位读 0 |
+| `mstatus` | 保留 `SIE`/`MIE`/`SPIE`/`MPIE`/`SPP`/`MPP`/`TSR`/`MPRV`；`MPP` 支持 M/S/U，保留编码合法化为 U，其余位读 0 |
 | `mtvec` | mode 0/1 保留，保留值 2/3 合法化为 0；基址天然 4 字节对齐 |
 | `mepc` | 屏蔽最低两位（IALIGN = 32） |
 | `mie` | 保留 M/S 的外部、软件、定时器使能位（11/9/7/5/3/1） |
@@ -206,6 +207,16 @@ CSR 的正确性集中在三件事，缺一不可。
 **访问不得跨区域**：一个访问必须完全落在单个区域内。起点在内但越过了区域末尾 → 故障，而不是去读下一个区域。
 
 `load_image` 是唯一的例外：镜像本身可以跨区域（`riscv-tests` 的二进制同时覆盖 `.text.init` 页与 `tohost` 页），因为它是逐字节装载的，这与「单次 guest 访问不得跨界」是两个不同的问题。
+
+### PMP 与有效特权
+
+`Csr` 持有独立的 `Pmp` 状态：16 项、G=0、32 位物理地址，`pmpaddr` 仅保存位 29:0；RV32 四个 packed 配置 CSR 位于 `0x3a0..0x3a3`，地址 CSR 位于 `0x3b0..0x3bf`。未实现 Smepmp。
+
+支持 OFF/TOR/NA4/NAPOT，按最低索引的相交项判断整次访存。未完全覆盖就拒绝；匹配项未锁定时 M 可绕过 R/W/X，锁定后 M 也受限；无匹配项时 M 允许、S/U 拒绝。复位所有项 OFF，因此固件进入 S/U 前必须显式放行。L 锁定本项配置与地址，锁定 TOR 还冻结前一项地址，直至 hart 复位；保留配置位读零，R=0/W=1 清除 W。
+
+CPU 在取指和每次 load/store 调用后备内存之前检查 PMP。MPRV=1 时数据访问使用 MPP 特权，取指始终使用当前特权。拒绝返回对应访问故障，保留原始指令/数据地址作为 tval，并复用 M/S 陷阱路由。模型将非对齐数据指令视作一次完整操作，跨项拒绝时不产生部分写入或 MMIO 调用。区域权限仍须通过，PMP 放行不会绕过地址映射。
+
+`tests/pmp.rs` 覆盖权限、边界、锁定和 MPRV。官方 `pmpaddr` 在 G=0 时只走寄存器探测路径；额外 `scripts/pmp.S` 通过执行与故障处理检查隔离，103 步程序与 Spike 一致（只比较现有 harness 的退休记录交集）。
 
 ## 8. 测试完成协议（HTIF）
 
@@ -245,9 +256,9 @@ CSR 的正确性集中在三件事，缺一不可。
 
 ### 官方套件
 
-上述不变量之外，`scripts/riscv-tests.sh` 跑官方 `rv32ui-p-*` 与 `rv32mi-p-*`，**56 通过、0 失败、2 excluded**。它比任何手写测试都更容易发现语义偏差——本项目中被它抓出的四处（`minstret` 抑制、非对齐数据访问、`csr[9:8]` 特权表方向、陷阱入口的 `MPP` 写入）都不是靠推理想到的。修改执行语义后应先跑它。
+上述不变量之外，`scripts/riscv-tests.sh` 跑官方 `rv32ui-p-*` 与 `rv32mi-p-*`，**57 通过、0 失败、1 excluded**。它比任何手写测试都更容易发现语义偏差——本项目中被它抓出的四处（`minstret` 抑制、非对齐数据访问、`csr[9:8]` 特权表方向、陷阱入口的 `MPP` 写入）都不是靠推理想到的。修改执行语义后应先跑它。
 
-被排除的两项写进 `scripts/riscv-tests.sh` 的注释并说明缺什么，而不是当作通过：这样表头的数字才有意义，被支持的测试里出回归也不会被淹没。
+被排除的一项写进 `scripts/riscv-tests.sh` 的注释并说明缺什么，而不是当作通过：这样表头的数字才有意义，被支持的测试里出回归也不会被淹没。
 
 `scripts/difftest.sh` 是可选的第三重安全网：与 Spike 逐步比对 PC、指令字、目的寄存器值与内存写入。它**不属于门禁**——Spike 不在 apt 源中，当前 CI 未配置 Spike 的固定版本构建与缓存；缺 Spike 时它打印 `SKIP` 并以 0 退出，`--require` 可让缺失变成失败。
 
@@ -293,12 +304,12 @@ x <step> pc=<8 hex> inst=<8 hex> [...]
 
 按对验证工作的阻塞程度排列，与 [`TODO.md`](TODO.md) 的优先级一致：
 
-1. **无 PMP 与调试触发模块**。`rv32mi-p-pmpaddr` 与 `rv32mi-p-breakpoint` 仍为 excluded。`rv32mi-p-illegal` 已通过并纳入门禁。
+1. **无调试触发模块**。仅 `rv32mi-p-breakpoint` 仍为 excluded。`rv32mi-p-pmpaddr` 与 `rv32mi-p-illegal` 已通过并纳入门禁；PMP 基础功能已实现，Smepmp 增强未实现。
 2. **无地址转换**。仅 Bare，`satp`/TVM/SUM/MXR 读零；选择不实现 `SFENCE.VMA` 并产生非法指令异常。引入 Sv32 时需要配套页表遍历、权限和 TVM 门控。
 3. **无 PLIC**。平台目前只有 CLINT，尚无外部中断控制器；S 级外部/定时器中断可由 M 软件注入。
-4. **差分比较不含 CSR 写入与完整最终状态**。新委派路径由定向回归与官方 `illegal` 测试验证，现有 225 步 Spike 探针尚不提供这部分完整差分覆盖。
+4. **差分比较不含 CSR 写入与完整最终状态**。新委派路径由定向回归与官方 `illegal` 测试验证，现有 225 步通用探针与 103 步 PMP 探针仍不提供这部分完整差分覆盖。
 
-本次特权语义依据固定版本的官方手册：[Machine-Level ISA v1.13](https://docs.riscv.org/reference/isa/v20260120/priv/machine.html)（委派、中断与 TSR）及 [Supervisor-Level ISA v1.13](https://docs.riscv.org/reference/isa/v20260120/priv/supervisor.html)（CSR 视图、Bare 与 SFENCE.VMA）。
+本次特权语义依据固定版本的官方手册：[Machine-Level ISA v1.13](https://docs.riscv.org/reference/isa/v20260120/priv/machine.html)（委派、中断、TSR、PMP 与 MPRV）及 [Supervisor-Level ISA v1.13](https://docs.riscv.org/reference/isa/v20260120/priv/supervisor.html)（CSR 视图、Bare 与 SFENCE.VMA）。
 
 ## 13. 扩展模型的方式
 

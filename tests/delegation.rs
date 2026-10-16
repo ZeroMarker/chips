@@ -22,6 +22,7 @@ const SEIP: u32 = 1 << 9;
 
 fn setup(mode: Privilege, values: &[(u32, u32)], body: &[u32]) -> (Cpu, Memory) {
     let (mut cpu, mut mem) = machine(CODE, body);
+    permit_all_memory(&mut cpu);
     let mut words = Vec::new();
     for &(address, value) in values {
         words.extend(li32(1, value));

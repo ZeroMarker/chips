@@ -188,3 +188,26 @@ pub fn run_until_halt(base: u32, words: &[u32]) -> Cpu {
         other => panic!("program did not halt: {other:?}"),
     }
 }
+
+/// Firmware-style PMP setup for tests concerned with privilege semantics rather
+/// than isolation. Entry 15 permits the full physical address space for S/U.
+/// Invoke in M-mode before attaching a trace or measuring counters.
+pub fn permit_all_memory(cpu: &mut Cpu) {
+    let saved_pc = cpu.pc();
+    let words = [
+        li32(31, u32::MAX)[0],
+        li32(31, u32::MAX)[1],
+        csrrw(chips::csr::addr::PMPADDR0 + 15, 31, 0),
+        li32(31, 0x1f00_0000)[0],
+        li32(31, 0x1f00_0000)[1],
+        csrrw(chips::csr::addr::PMPCFG0 + 3, 31, 0),
+        li(31, 0),
+    ];
+    let mut mem = Memory::permissive();
+    load_words(&mut mem, 0x7000, &words);
+    cpu.set_pc(0x7000);
+    for _ in words {
+        assert_eq!(cpu.step(&mut mem), Ok(chips::StepOutcome::Continue));
+    }
+    cpu.set_pc(saved_pc);
+}

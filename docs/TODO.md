@@ -4,7 +4,7 @@ Rust 黄金参考模型及其未来 RTL 对应实现的工作台账。条目按�
 
 ## 当前状态
 
-2026-10-16 本地复测：150 个 Rust 测试在 debug/release 下均通过；官方选定套件为 **56 通过、0 失败、2 排除、0 跳过**；Spike 自带探针的 **225 步程序一致**（比较记录共 1999 条，含末尾自旋）；交叉工具链冒烟、格式、Clippy 与 rustdoc 检查通过。
+2026-10-16 本地复测：162 个 Rust 测试在 debug/release 下均通过；官方选定套件为 **57 通过、0 失败、1 排除、0 跳过**；Spike 通用探针 **225 步**及额外 PMP 探针 **103 步**均一致（含末尾自旋分别比较 1999 / 1997 条退休记录）；交叉工具链冒烟、格式、Clippy 与 rustdoc 检查通过。
 
 P0 已达成，P1 大部分实现但尚未满足全套通过与随机差分验收；P2 RTL、P3 模型/RTL 交叉验证未开始。以下勾选表示该项功能或基础设施已实现，不表示完整芯片验收通过。
 
@@ -29,7 +29,7 @@ P0 已达成，P1 大部分实现但尚未满足全套通过与随机差分验�
 - [x] 文档结构重整：文档统一为中文，路线图/清单/背景参考移入 `docs/`，交叉引用与代码注释同步更新。
 - [x] 给内存模型加入解码后的地址映射与访问故障（`InstructionAccessFault`/`LoadAccessFault`/`StoreAccessFault`），并为 RAM 提供 O(1) 的平坦后备（`src/mem.rs`、`tests/memory.rs`）。
 - [x] 实现 HTIF `tohost`/`fromhost` 协议与 `riscv-tests` 目标平台定义（`src/htif.rs`、`src/platform.rs`）。
-- [x] 把工具链冒烟测试扩展为真正的 `riscv-tests` runner：`scripts/riscv-tests.sh` 克隆、配置（XLEN=32）、构建并运行 `rv32ui-p-*`/`rv32mi-p-*`，经 `--htif` 读取 `tohost` 判定 pass/fail。**58 个测试中 56 个通过，0 个失败，2 个 excluded。**
+- [x] 把工具链冒烟测试扩展为真正的 `riscv-tests` runner：`scripts/riscv-tests.sh` 克隆、配置（XLEN=32）、构建并运行 `rv32ui-p-*`/`rv32mi-p-*`，经 `--htif` 读取 `tohost` 判定 pass/fail。**58 个测试中 57 个通过，0 个失败，1 个 excluded。**
 - [x] 将 `riscv-tests` 接入 CI（`riscv-tests` job）。
 - [x] 修正两处由官方套件暴露的架构缺陷：写入 `minstret` 必须抑制该指令自身的计数增量（`instret_overflow`）；非对齐**数据**访问应当完成而非陷阱（`ma_data`）。
 - [x] 实现中断交付：新增 CLINT（`msip`/`mtimecmp`/`mtime`，SiFive FE310 布局，`src/clint.rs`），`mip` 的机器级源由设备驱动，监管级 pending 支持软件注入，`time`/`timeh` 跟随 CLINT；中断在步骤边界交付，`mcause` 以 RV32 最高位标记中断、低位保存原因号，向量化 `mtvec` 首次真正生效（`tests/interrupts.rs`，19 个测试）。
@@ -42,11 +42,15 @@ P0 已达成，P1 大部分实现但尚未满足全套通过与随机差分验�
 - [x] 实现 TSR 对 S 级 SRET 的门控，明确 Bare-only 能力：`satp`/TVM/SUM/MXR 读零，`SFENCE.VMA` 非法。未来引入 Sv32 时再实现 TVM=1 门控与 SUM/MXR 页权限。
 - [x] 解除 `rv32mi-p-illegal` 排除并通过；新增 `tests/delegation.rs` 的 11 个测试，含特权/委派/源使能/全局使能组合矩阵。
 
+- [x] 实现 16 项 PMP（`src/pmp.rs`）：32 位物理地址、4 字节粒度、OFF/TOR/NA4/NAPOT、R/W/X、L 锁定与 TOR 前驱地址锁定。按最低索引匹配整次访存，拒绝跨项访问，检查先于 RAM/MMIO 副作用。
+- [x] 接入 `pmpcfg0..3`/`pmpaddr0..15` 与 MPRV：S/U 无匹配规则时拒绝访存，M 级未锁定项可绕过权限；MPRV 数据访问使用 MPP，取指不受影响，返回低特权时清除 MPRV。已有特权测试显式配置放行规则。
+- [x] 解除 `rv32mi-p-pmpaddr` 排除；新增 `tests/pmp.rs` 的 12 个回归及 `scripts/pmp.S` 的 103 步 Spike 定向差分。G=0 官方探测测试并不覆盖完整隔离行为，后者由这些补充测试验证。
+
 ## 接下来
 
-先补齐剩余官方套件排除项（PMP、调试触发模块），再扩大差分覆盖、固定参考工具版本；之后推进 C 扩展与最小 RTL。Sv32 与 TVM=1/SUM/MXR 页权限留待地址翻译阶段。
+先补齐剩余官方套件排除项（调试触发模块），再扩大差分覆盖、固定参考工具版本；之后推进 C 扩展与最小 RTL。Sv32 与 TVM=1/SUM/MXR 页权限留待地址翻译阶段。
 
-- [ ] 补齐 `rv32mi-p-pmpaddr` 所需的物理内存保护（`pmpcfg0`/`pmpaddr0-15`）与 `rv32mi-p-breakpoint` 所需的调试触发模块（`tcontrol`/`tselect`/`tdata1-3`）。两者当前是 excluded 而非通过，理由写在 `scripts/riscv-tests.sh` 的注释里。
+- [ ] 补齐 `rv32mi-p-breakpoint` 所需的调试触发模块（`tcontrol`/`tselect`/`tdata1-3`）。它是当前唯一 excluded，理由写在 `scripts/riscv-tests.sh` 的注释里。
 - [ ] 扩充差分比较的范围。当前 `scripts/difftest.sh` 只比较**已退休**的指令——这是 Spike 提交日志唯一记录的东西——因此 CSR 写入完全不在交集内。补充比较最终架构状态（全部寄存器 + 可读 CSR）与 CSR 写入序列，才能覆盖 trap 入口的 `mepc`/`mcause`/`mtval` 写入。
 - [ ] 收敛差分测试的程序集。`scripts/difftest.S` 刻意避开了两类行为：非对齐数据访问（Spike 陷阱、模型完成，**两者都合规**，而一条分歧指令会使其后每一条都错位）与取值由实现决定的寄存器（`misa` 报告扩展位，`cycle`/`time`/`instret` 的值只在各自机器上有意义）。每排除一类都缩小了覆盖，因此需要更多程序来补上——这也是「受限随机的指令生成」的前提。
 - [ ] 为差分 harness 固定 Spike 的构建方式。Spike **不在 Ubuntu apt 源中**，本环境从源码构建（`riscv-isa-sim`，依赖 autoconf/gmp/mpc/dtc）；注意**代理内核 `pk` 已从 riscv-isa-sim 中移除**，因此 Spike 内建 HTIF 与 `riscv-tests` 的 `tohost` 约定并不相同——这正是 `scripts/difftest.S` 用自旋地址而非 `tohost` 报告结果的原因。
@@ -66,7 +70,7 @@ P0 已达成，P1 大部分实现但尚未满足全套通过与随机差分验�
 - RISC-V 交叉工具链（`riscv64-unknown-elf-gcc` 13.2.0）已安装，`scripts/riscv-smoke.sh --require` 与 `scripts/riscv-tests.sh --require` 均可在本地完整跑通。
 - **Spike 已从源码构建并可用**，位于 `/tmp/opencode/spike-install/bin/spike`（`riscv-isa-sim`，`--prefix=/tmp/opencode/spike-install`）。`spike` 不在 Ubuntu apt 源中，**QEMU、Verilator、yosys 仍未安装**。运行差分测试：`export PATH="/tmp/opencode/spike-install/bin:$PATH" && bash scripts/difftest.sh`。
 - 注意默认 `make` **不构建代理内核 `pk`**，且 `pk` 已被移出 riscv-isa-sim，因此 Spike 内建 HTIF 与 `riscv-tests` 的 `tohost` 约定不同：Spike 会把 `tohost` 的高字节当作 syscall 号。差分测试因此不使用 `tohost` 报告结果。
-- 150 个 Rust 测试不依赖任何外部工具，`cargo test --all-targets` 即可全部运行。但它们使用手工编码的指令字，**不**覆盖编译器产生的真实编码——那部分由 `riscv-smoke` 与 `riscv-tests` 验证。
+- 162 个 Rust 测试不依赖任何外部工具，`cargo test --all-targets` 即可全部运行。但它们使用手工编码的指令字，**不**覆盖编译器产生的真实编码——那部分由 `riscv-smoke` 与 `riscv-tests` 验证。
 - `scripts/riscv-tests.sh` 默认克隆到临时目录并在结束时删除。用 `RISCV_TESTS_DIR=/path` 复用已有克隆/构建树时，该目录**永远不会被脚本删除**（这是刻意的：一个脚本不应删除调用者指定的目录）。本环境的复用目录是 `/tmp/opencode/rt`。
 - `scripts/difftest.sh` **不属于门禁**：当前 CI 未配置 Spike 的固定版本构建与缓存。缺 Spike 时该脚本打印 `SKIP` 并以 0 退出；`--require` 可让缺失变成失败。
-- 当前 `riscv-tests` 成绩：**56 通过、0 失败、2 excluded**（`rv32mi-p-breakpoint`、`rv32mi-p-pmpaddr`）。排除理由写在 `scripts/riscv-tests.sh` 的注释中。
+- 当前 `riscv-tests` 成绩：**57 通过、0 失败、1 excluded**（`rv32mi-p-breakpoint`）。排除理由写在 `scripts/riscv-tests.sh` 的注释中。

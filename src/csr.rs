@@ -32,6 +32,7 @@
 use std::collections::BTreeMap;
 
 use crate::isa::Privilege;
+use crate::pmp::Pmp;
 
 /// Standard CSR addresses (unprivileged, supervisor, and machine level).
 pub mod addr {
@@ -81,6 +82,10 @@ pub mod addr {
     pub const MCAUSE: u32 = 0x342;
     pub const MTVAL: u32 = 0x343;
     pub const MIP: u32 = 0x344;
+    /// First of four packed RV32 PMP configuration CSRs (0x3A0..=0x3A3).
+    pub const PMPCFG0: u32 = 0x3A0;
+    /// First of sixteen PMP address CSRs (0x3B0..=0x3BF).
+    pub const PMPADDR0: u32 = 0x3B0;
     // Machine counters (read/write).
     pub const MCYCLE: u32 = 0xB00;
     pub const MINSTRET: u32 = 0xB02;
@@ -102,6 +107,8 @@ pub const MSTATUS_MPIE: u32 = 1 << 7;
 pub const MSTATUS_SPP: u32 = 1 << 8;
 /// Intercept SRET in S-mode; M-mode can still execute it.
 pub const MSTATUS_TSR: u32 = 1 << 22;
+/// Use MPP as the effective privilege for explicit data accesses.
+pub const MSTATUS_MPRV: u32 = 1 << 17;
 /// `mstatus.MPP` — previous privilege for `mret`. Two bits, so it can hold M.
 pub const MSTATUS_MPP_SHIFT: u32 = 11;
 pub const MSTATUS_MPP: u32 = 0b11 << MSTATUS_MPP_SHIFT;
@@ -118,7 +125,8 @@ const MSTATUS_WRITABLE: u32 = MSTATUS_SIE
     | MSTATUS_MPIE
     | MSTATUS_SPP
     | MSTATUS_MPP
-    | MSTATUS_TSR;
+    | MSTATUS_TSR
+    | MSTATUS_MPRV;
 
 /// Supervisor pending bits. M-mode can inject all three; S-mode can write
 /// only SSIP, and only when it has been delegated.
@@ -138,6 +146,7 @@ const EPC_MASK: u32 = !0b11;
 #[derive(Debug, Default)]
 pub struct Csr {
     data: BTreeMap<u32, u32>,
+    pmp: Pmp,
 }
 
 impl Csr {
@@ -149,10 +158,12 @@ impl Csr {
     /// Does this model implement `csr`? Accessing any other address is an
     /// illegal instruction.
     pub fn exists(csr: u32) -> bool {
-        matches!(
-            csr,
-            // Unprivileged counters.
-            addr::CYCLE
+        (addr::PMPCFG0..addr::PMPCFG0 + 4).contains(&csr)
+            || (addr::PMPADDR0..addr::PMPADDR0 + 16).contains(&csr)
+            || matches!(
+                csr,
+                // Unprivileged counters.
+                addr::CYCLE
                 | addr::TIME
                 | addr::INSTRET
                 | addr::CYCLEH
@@ -190,7 +201,7 @@ impl Csr {
                 | addr::MINSTRET
                 | addr::MCYCLEH
                 | addr::MINSTRETH
-        )
+            )
     }
 
     /// The privilege a register requires, from its address.
@@ -225,6 +236,12 @@ impl Csr {
     /// is reported as an illegal instruction rather than as a read of state that
     /// belongs to a more privileged mode.
     pub fn read(&self, csr: u32) -> u32 {
+        if (addr::PMPCFG0..addr::PMPCFG0 + 4).contains(&csr) {
+            return self.pmp.read_config((csr - addr::PMPCFG0) as usize);
+        }
+        if (addr::PMPADDR0..addr::PMPADDR0 + 16).contains(&csr) {
+            return self.pmp.read_address((csr - addr::PMPADDR0) as usize);
+        }
         let raw = self.data.get(&storage_for(csr)).copied().unwrap_or(0);
         match csr {
             // Fixed-value registers.
@@ -256,6 +273,14 @@ impl Csr {
     /// alias can see, so a supervisor cannot disturb `mstatus.MIE` by writing
     /// `sstatus`.
     pub fn write(&mut self, csr: u32, val: u32) {
+        if (addr::PMPCFG0..addr::PMPCFG0 + 4).contains(&csr) {
+            self.pmp.write_config((csr - addr::PMPCFG0) as usize, val);
+            return;
+        }
+        if (addr::PMPADDR0..addr::PMPADDR0 + 16).contains(&csr) {
+            self.pmp.write_address((csr - addr::PMPADDR0) as usize, val);
+            return;
+        }
         if Self::is_read_only(csr) {
             return;
         }
@@ -297,6 +322,11 @@ impl Csr {
             _ => merged,
         };
         self.data.insert(slot, stored);
+    }
+
+    /// Physical memory protection state for CPU access checks.
+    pub fn pmp(&self) -> &Pmp {
+        &self.pmp
     }
 
     /// The `mip` bits this machine can ever report.

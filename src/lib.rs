@@ -16,8 +16,9 @@
 //! unmapped access raises an access fault.
 //!
 //! Not yet implemented: `C` (compressed), `A` (atomics), `F`/`D` (floating
-//! point), virtual memory, PMP, and debug triggers. M/S/U privileges, delegated
-//! traps, CLINT, and software-injected supervisor interrupts are implemented.
+//! point), virtual memory, and debug triggers. M/S/U privileges, delegated
+//! traps, CLINT, software-injected supervisor interrupts, and sixteen PMP
+//! entries with MPRV data-access checks are implemented.
 //! Encodings that require a missing extension raise [`cpu::Trap::Unsupported`]
 //! or [`cpu::Trap::IllegalInstruction`] rather than silently producing a wrong
 //! result. `time`/`timeh` follow a mapped CLINT, with a per-step fallback time
@@ -30,6 +31,7 @@ pub mod htif;
 pub mod isa;
 pub mod mem;
 pub mod platform;
+pub mod pmp;
 pub mod trace;
 
 pub use clint::Clint;

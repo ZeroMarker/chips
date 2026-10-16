@@ -14,11 +14,11 @@
 //! for synchronous traps. WFI completes immediately as a hint.
 
 use crate::csr::{
-    addr as csr_addr, Csr, MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP, MSTATUS_MPP_SHIFT, MSTATUS_SIE,
-    MSTATUS_SPIE, MSTATUS_SPP, MSTATUS_TSR,
+    addr as csr_addr, Csr, MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP, MSTATUS_MPP_SHIFT, MSTATUS_MPRV,
+    MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP, MSTATUS_TSR,
 };
 use crate::isa::{self, Decoded, Privilege};
-use crate::mem::Memory;
+use crate::mem::{Access, Memory};
 use crate::trace::{Change, Record, StepResult, Trace};
 
 /// Outcome of executing a single instruction.
@@ -333,6 +333,10 @@ impl Cpu {
             return self.finish_step(result, pc, 0);
         }
 
+        if let Err(trap) = self.check_memory(pc, 4, Access::Fetch) {
+            let result = self.handle_trap(trap);
+            return self.finish_step(result, pc, 0);
+        }
         let raw = match mem.fetch_u32(pc) {
             Ok(raw) => raw,
             Err(fault) => {
@@ -543,6 +547,27 @@ impl Cpu {
         });
     }
 
+    /// PMP precedes backing memory/device access. Instruction fetch always uses
+    /// current privilege; MPRV substitutes MPP for explicit data operations.
+    fn check_memory(&self, addr: u32, len: u32, access: Access) -> Result<(), Trap> {
+        let status = self.csr.read(csr_addr::MSTATUS);
+        let effective = if access != Access::Fetch && status & MSTATUS_MPRV != 0 {
+            Privilege::from_encoding((status & MSTATUS_MPP) >> MSTATUS_MPP_SHIFT)
+                .unwrap_or(Privilege::User)
+        } else {
+            self.privilege
+        };
+        if self.csr.pmp().permits(effective, addr, len, access) {
+            Ok(())
+        } else {
+            Err(match access {
+                Access::Fetch => Trap::InstructionAccessFault(addr),
+                Access::Load => Trap::LoadAccessFault(addr),
+                Access::Store => Trap::StoreAccessFault(addr),
+            })
+        }
+    }
+
     fn execute(&mut self, inst: Decoded, mem: &mut Memory) -> Result<StepOutcome, Trap> {
         let pc = self.pc;
         let Decoded {
@@ -611,6 +636,7 @@ impl Cpu {
             isa::opcode::LOAD => {
                 let addr = self.x(rs1).wrapping_add(imm as u32);
                 let load = |m: &Memory, a: u32, n: u32| -> Result<u64, Trap> {
+                    self.check_memory(a, n, Access::Load)?;
                     m.load(a, n).map_err(|f| Trap::LoadAccessFault(f.addr))
                 };
                 let val = match funct3 {
@@ -630,6 +656,7 @@ impl Cpu {
                 let addr = self.x(rs1).wrapping_add(imm as u32);
                 let val = self.x(rs2);
                 let store = |m: &mut Memory, a: u32, n: u32, v: u64| -> Result<(), Trap> {
+                    self.check_memory(a, n, Access::Store)?;
                     m.store(a, n, v).map_err(|f| Trap::StoreAccessFault(f.addr))
                 };
                 let width = match funct3 {
@@ -824,6 +851,9 @@ impl Cpu {
 
         // Reset the saved privilege to the least privileged supported mode.
         next &= if machine { !MSTATUS_MPP } else { !MSTATUS_SPP };
+        if target != Privilege::Machine {
+            next &= !MSTATUS_MPRV;
+        }
         self.write_csr(csr_addr::MSTATUS, next);
 
         self.privilege = target;

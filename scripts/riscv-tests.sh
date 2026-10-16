@@ -151,11 +151,8 @@ echo "riscv-tests: running ${#targets[@]} binaries on the model"
 #                       The test's own handler jumps straight to `fail` when a
 #                       `tselect` write traps, so an implementation without the
 #                       module cannot pass it. Debug spec, not base ISA.
-#   rv32mi-p-pmpaddr     physical memory protection (pmpaddr0/pmpcfg0). The
-#                       model has no PMP at all.
 excluded_patterns=(
   "rv32mi-p-breakpoint"
-  "rv32mi-p-pmpaddr"
 )
 is_excluded() {
   local name=$1 pattern

@@ -434,6 +434,7 @@ fn the_trace_distinguishes_an_ecall_from_each_mode() {
     for mode in chips::isa::Privilege::ALL {
         let sink = Lines::default();
         let (mut cpu, mut mem) = machine(CODE, &[]);
+        permit_all_memory(&mut cpu);
         cpu.set_trace(Some(Box::new(sink.clone())));
         // Install the handler *from machine mode* — writing mtvec from U would
         // itself be an illegal instruction — then drop to `mode` and ecall, so

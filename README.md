@@ -2,11 +2,11 @@
 
 一颗 RISC-V 处理器的双轨研发仓库：**Rust 功能模型**（黄金参考）与**硬件 RTL**（尚未开始）并行推进，以交叉验证为耦合主线。
 
-当前轨道 A 已实现一个可执行的 **RV32IMZicsr** 核心：完整 RV32I 基础整数集、RV32M 乘除、Zicsr CSR 访问，**M/S/U 三级特权**与陷阱进入、CLINT 中断交付与内存映射 `mtime`。它是后续 RTL 的**黄金参考模型**——RTL 必须与它跑同一套程序、得到一致结果。
+当前轨道 A 已实现一个可执行的 **RV32IMZicsr** 核心：完整 RV32I 基础整数集、RV32M 乘除、Zicsr CSR 访问，**M/S/U 三级特权**与陷阱进入、CLINT 中断交付与内存映射 `mtime`，以及 16 项 PMP 物理内存保护。它是后续 RTL 的**黄金参考模型**——RTL 必须与它跑同一套程序、得到一致结果。
 
-模型已接入官方 **`riscv-tests`** 一致性套件：`rv32ui-p-*` 与 `rv32mi-p-*` 共 58 个测试中 **56 个通过**，另 2 个因需要尚未实现的硬件设施而排除（详见下文）。
+模型已接入官方 **`riscv-tests`** 一致性套件：`rv32ui-p-*` 与 `rv32mi-p-*` 共 58 个测试中 **57 个通过**，另 1 个因需要尚未实现的调试触发模块而排除（详见下文）。
 
-模型同时接入 **Spike 差分测试**：`scripts/difftest.sh` 在同一程序上逐步比较 PC、指令字、目的寄存器与其值、内存写入的地址与值。当前自带的 225 步探针程序两侧一致，尚未覆盖随机指令流、CSR 写入与完整最终架构状态。
+模型同时接入 **Spike 差分测试**：`scripts/difftest.sh` 在同一程序上逐步比较 PC、指令字、目的寄存器与其值、内存写入的地址与值。当前通用 225 步与额外 PMP 103 步探针程序均两侧一致，尚未覆盖随机指令流、CSR 写入与完整最终架构状态。
 
 - 目标配置：`RV32IMC` 起步（当前 `RV32IMZicsr`，`C` 扩展待做）
 - 特权级：M / S / U；支持 `medeleg`/`mideleg` 陷阱委派与 S 级中断，地址翻译仅支持 Bare
@@ -18,13 +18,13 @@
 
 | 本地检查 | 结果 |
 |----------|------|
-| Rust 测试（debug / release） | 每种 profile 均为 150 通过、0 失败 |
-| 官方选定套件（`rv32ui-p-*` / `rv32mi-p-*`） | 56 通过、0 失败、2 排除、0 跳过 |
-| Spike 自带探针 | 225 步程序一致；脚本共比较 1999 条退休记录，包含末尾自旋 |
+| Rust 测试（debug / release） | 每种 profile 均为 162 通过、0 失败 |
+| 官方选定套件（`rv32ui-p-*` / `rv32mi-p-*`） | 57 通过、0 失败、1 排除、0 跳过 |
+| Spike 探针 | 通用 225 步、PMP 103 步均一致；含自旋分别比较 1999 / 1997 条退休记录 |
 | 交叉工具链冒烟测试 | 通过 |
 | 格式、Clippy、rustdoc | 通过 |
 
-这些结果描述当前选定测试的覆盖范围，不代表完整 ISA/特权规范认证或硬件验收。下一步优先补齐特权与陷阱语义、扩大差分覆盖并固定工具版本，再实现 C 扩展和最小单周期 RTL。完整范围见工作清单与路线图。
+这些结果描述当前选定测试的覆盖范围，不代表完整 ISA/特权规范认证或硬件验收。下一步补齐调试触发模块、扩大差分覆盖并固定工具版本，再实现 C 扩展和最小单周期 RTL。完整范围见工作清单与路线图。
 
 ## 文档
 
@@ -57,13 +57,14 @@ cargo test --all-targets
 cargo test --release --all-targets    # release 关闭溢出检查，结果必须一致
 ```
 
-150 个测试，分布在：
+162 个测试，分布在：
 
 | 测试文件 | 数量 | 覆盖内容 |
 |----------|------|----------|
 | `tests/rv32im.rs` | 7 | 手工编码指令字的 RV32I/M/Zicsr 执行语义 |
 | `tests/isa_coverage.rs` | 9 | 表驱动的指令组覆盖与架构边界情况 |
 | `tests/traps.rs` | 16 | 陷阱进入/`mret`、CSR 字段语义、扩展缺失诊断 |
+| `tests/pmp.rs` | 12 | PMP 权限、匹配边界、锁定、MPRV、访问故障、设备副作用 |
 | `tests/memory.rs` | 15 | 地址映射、区域权限、访问故障、后备实现等价性 |
 | `tests/htif.rs` | 13 | `tohost` 协议编解码、`riscv-tests` 平台内存布局 |
 | `tests/interrupts.rs` | 19 | CLINT 寄存器、`mip`/`mie`/`MIE` 门控、优先级、向量入口、WFI |
@@ -177,14 +178,15 @@ RISCV_TESTS_DIR=/path/to/tree scripts/riscv-tests.sh   # 复用已有克隆（�
 
 脚本会克隆 `riscv-tests`（含 `env` 子模块）、以 `XLEN=32` 配置、构建 `rv32ui-p-*` 与 `rv32mi-p-*`，然后逐个在模型上运行。
 
-当前结果：**58 个测试，56 通过，0 失败，2 排除**。被排除的两个需要模型尚未实现的设施，因此单独报告而非计入通过：
+当前结果：**58 个测试，57 通过，0 失败，1 排除**。被排除的一项需要模型尚未实现的调试触发模块，因此单独报告而非计入通过：
 
 | 测试 | 需要 |
 |------|------|
 | `rv32mi-p-breakpoint` | 调试触发模块（`tcontrol`/`tselect`/`tdata1-3`） |
-| `rv32mi-p-pmpaddr` | 物理内存保护（`pmpcfg0`/`pmpaddr0-15`） |
 
 `rv32mi-p-illegal` 已解除排除并通过：支持软件置起 SSIP、正确的中断原因码与向量入口、`mideleg` 及 TSR 门控。模型选择 Bare-only 能力：`satp`、TVM、SUM、MXR 读零，`SFENCE.VMA` 产生非法指令异常，测试走无分页分支。剩余排除项在脚本中显式列出，任何其他测试失败都会令脚本以非零码退出。
+
+`rv32mi-p-pmpaddr` 也已纳入门禁并通过。本模型 PMP 为 16 项、4 字节粒度（G=0）、32 位物理地址，支持 OFF/TOR/NA4/NAPOT、R/W/X 与 L 锁定。该官方测试在 G=0 时仅检查寄存器探测路径；实际隔离行为另由 12 个 Rust 回归和 PMP 汇编探针验证。复位后 S/U 默认没有访存权限，固件必须先配置 PMP 放行规则；MPRV 可让 M 级数据访问使用 MPP 权限。
 
 ## 与 Spike 的差分测试
 
@@ -200,6 +202,15 @@ SPIKE=/path/to/spike bash scripts/difftest.sh
 自带的探针程序是 `scripts/difftest.S`（**不是**任何套件成员）：官方测试的序言会探测可选 CSR，两侧实现的子集不同，可能在真实运算之前就走出不同路径。当前结果：**225 步程序，两侧完全一致**。
 
 两处必须留在比较范围之外，都是「架构未规定」而非缺陷：**非对齐数据访问**（Spike 陷阱、模型完成，两者都合规）与**取值由实现决定的寄存器**（`misa` 报告扩展位，计数器只在各自机器上有意义）。详见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §11。
+
+额外的 PMP 探针 [`scripts/pmp.S`](scripts/pmp.S) 覆盖 MPRV 读写、M 级未锁定绕过与锁定后拒绝、锁定 CSR 不可改写，以及 S 级访问故障后返回。103 步程序与 Spike 一致；它需显式指定，不属于默认 225 步探针：
+
+```sh
+mkdir -p target
+riscv64-unknown-elf-gcc -march=rv32im_zicsr -mabi=ilp32 -nostdlib -nostartfiles \
+    -T scripts/difftest.ld -o target/pmp.elf scripts/pmp.S
+SPIKE=/path/to/spike bash scripts/difftest.sh --require target/pmp.elf
+```
 
 ## 端到端冒烟测试
 
@@ -227,7 +238,7 @@ scripts/riscv-smoke.sh --require    # 缺少工具链则失败——CI 用此模
 
 - 与 Spike 的差分比对——Spike **不在 apt 源中**，需从源码构建（`riscv-isa-sim`）。当前 CI 未配置 Spike 的固定版本构建与缓存，因此尚未将它纳入门禁：`bash scripts/difftest.sh` 在缺 Spike 时打印 `SKIP` 并以 0 退出，加 `--require` 可让缺失变成失败
 - RTL 硬件轨道——本仓库尚无 RTL
-- `rv32mi-p-breakpoint` 与 `rv32mi-p-pmpaddr`（见上文排除说明）
+- `rv32mi-p-breakpoint`（见上文排除说明）
 
 另有一条硬性约束：`Cargo.toml` 中声明 `unsafe_code = "forbid"`，模型全部为安全 Rust。CI 将警告视为失败，因此这条约束是构建期检查而非约定。
 
@@ -237,7 +248,7 @@ scripts/riscv-smoke.sh --require    # 缺少工具链则失败——CI 用此模
 
 - `C`（压缩）、`A`（原子）、`F`/`D`（浮点）、`V`（向量）扩展
 - 虚拟内存与地址翻译：`satp` 固定读零（Bare），TVM/SUM/MXR 读零，`SFENCE.VMA` 非法；TSR 可写且对 S 级 SRET 生效
-- PMP 物理内存保护、调试触发模块
+- 调试触发模块；PMP 基础功能已实现，未实现 Smepmp 增强
 - PLIC（故 `MEIP` 永不被置起）、外设总线与 boot ROM
 - 差分比较不含 CSR 写入——Spike 提交日志不记录它们，不在交集内
 
