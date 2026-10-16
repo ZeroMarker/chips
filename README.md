@@ -24,7 +24,7 @@
 | 交叉工具链冒烟测试 | 通过 |
 | 格式、Clippy、rustdoc | 通过 |
 
-这些结果描述当前选定测试的覆盖范围，不代表完整 ISA/特权规范认证或硬件验收。下一步扩大差分覆盖并固定工具版本，再实现 C 扩展和最小单周期 RTL。完整范围见工作清单与路线图。
+这些结果描述当前选定测试的覆盖范围，不代表完整 ISA/特权规范认证或硬件验收。下一步扩展受限随机差分覆盖，再实现 C 扩展和最小单周期 RTL。完整范围见工作清单与路线图。
 
 ## 文档
 
@@ -75,7 +75,7 @@ cargo test --release --all-targets    # release 关闭溢出检查，结果必�
 | `tests/architecture.rs` | 7 | 取指对齐、非对齐数据访问、计数器、保留编码 |
 | `tests/cli.rs` | 16 | 驱动层：参数、退出码、检查点、独立状态快照与 trace 输出 |
 
-另有 13 个 Python harness 回归：`python3 -m unittest discover -s scripts/tests -v`，已接入 CI，无需 Spike 或交叉工具链。
+另有 20 个 Python 回归（13 个差分 harness、7 个构建缓存）：`python3 -m unittest discover -s scripts/tests -v`，已接入 CI，无需 Spike 或交叉工具链。
 
 测试用手工编码的指令字（`tests/common/mod.rs` 提供编码器，避免手写位域出错）。`cargo test` 只跑 Rust 测试，**不**验证编译器产生的真实编码——那需要交叉工具链，由下面的冒烟测试与一致性套件负责。
 
@@ -200,6 +200,22 @@ bash scripts/difftest.sh -v          # 比较起点、检查点与超时配置
 SPIKE=/path/to/spike bash scripts/difftest.sh
 ```
 
+仓库将 Spike 源码固定在 [`spike.lock.json`](scripts/spike.lock.json) 中的提交 `0bff12123b1fd510e19e19634dd997dbade70e54`。可直接构建并运行：
+
+```sh
+# Ubuntu 构建依赖；另外需安装 gcc-riscv64-unknown-elf、Rust 和 Python 3.10+
+sudo apt-get install build-essential git device-tree-compiler libgmp-dev libmpc-dev
+SPIKE=$(bash scripts/build-spike.sh --jobs 4)
+export SPIKE
+bash scripts/difftest.sh --require
+```
+
+构建器从上游按完整 SHA 获取干净源码，固定配置为 `--with-boost=no`、GCC/G++ 与 `-O2`，只构建差分所需的 `spike` 可执行文件，不安装 SDK 或 `pk`。stdout 只返回二进制绝对路径；进度写入 stderr，完整构建日志保存在 `target/tools/spike/<key>.log`。首次构建可能耗时数分钟，默认最多 4 个并行任务。
+
+缓存位于 `target/tools/spike/<key>/`，`build.json` 记录源码、构建脚本摘要、主机 ABI、编译器/链接器身份和二进制 SHA-256。命中缓存时重新校验这些内容；中断或失败的构建不会发布缓存条目。`--cache-dir DIR` 可指定缓存根目录，`--cache-key` 仅输出缓存标识，不下载或构建。若条目损坏，删除报错中的生成目录或选用新的缓存目录后重试。临时源码与对象文件自动清理，构建日志保留。
+
+这固定了源码和构建配置，不保证跨系统产物逐字节相同；系统依赖仍由宿主机提供。更新参考版本时修改 lock，并用新生成的二进制重新验证全部探针。CI 使用同一构建器和严格匹配的缓存，Ubuntu 24.04 上以 `--require` 执行四组差分；本地直接调用 `difftest.sh` 的缺工具跳过行为保留。
+
 默认构建并运行四组探针：通用指令 225 步、PMP 103 步、触发器 105 步、M/S/U 委派与嵌套陷阱 53 步；对应退休记录为 224 / 100 / 101 / 51 条。程序到达 `pass_spin` 即停止，不比较末尾自旋。四组逐步状态均一致。
 
 harness 比较退休记录中的 PC、指令字、目的寄存器写入及内存写入，还通过模型 `--state-log` 和 Spike 调试器分别读取每步后的 PC、特权级、x0–x31 与 **40 个 CSR 的共有字段**。陷阱入口即使没有退休记录，其 `mepc`/`mcause`/`mtval` 和 S 级对应状态也被直接核对。CSR 写入同值或别名的文本记录不要求一一相同；比较的是实际逐步效果。掩码及边界见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §11。
@@ -233,14 +249,14 @@ scripts/riscv-smoke.sh --require    # 缺少工具链则失败——CI 用此模
 
 | Job | 内容 |
 |-----|------|
-| `lint` | `cargo fmt --check`、Clippy（`-D warnings`）、`cargo doc`（`-D warnings`） |
+| `lint` | 格式、Clippy、rustdoc 与 20 个 Python 差分 / 缓存回归 |
 | `test` | Linux / macOS / Windows，debug 与 release 两种 profile |
 | `riscv-smoke` | 安装交叉工具链，以 `--require` 运行冒烟测试 |
 | `riscv-tests` | 安装交叉工具链与 autoconf 等，以 `--require` 运行官方一致性套件 |
+| `spike-difftest` | Ubuntu 24.04，固定 Spike 源码构建 / 校验缓存，以 `--require` 运行四组探针 |
 
 **CI 尚不覆盖**：
 
-- 与 Spike 的差分比对——Spike **不在 apt 源中**，需从源码构建（`riscv-isa-sim`）。当前 CI 未配置 Spike 的固定版本构建与缓存，因此尚未将它纳入门禁：`bash scripts/difftest.sh` 在缺 Spike 时打印 `SKIP` 并以 0 退出，加 `--require` 可让缺失变成失败
 - RTL 硬件轨道——本仓库尚无 RTL
 
 另有一条硬性约束：`Cargo.toml` 中声明 `unsafe_code = "forbid"`，模型全部为安全 Rust。CI 将警告视为失败，因此这条约束是构建期检查而非约定。

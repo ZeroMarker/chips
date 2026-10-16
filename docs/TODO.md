@@ -4,7 +4,7 @@ Rust 黄金参考模型及其未来 RTL 对应实现的工作台账。条目按�
 
 ## 当前状态
 
-2026-10-16 本地复测：182 个 Rust 测试在 debug/release 下均通过；13 个 Python harness 回归通过；官方选定套件为 **58 通过、0 失败、0 排除、0 跳过**；Spike 通用 / PMP / 触发器 / 委派四组探针 **225 / 103 / 105 / 53 步**均一致，逐步核对全部整数寄存器及 40 个 CSR 的共有字段；交叉工具链冒烟、格式、Clippy 与 rustdoc 检查通过。
+2026-10-16 本地复测：182 个 Rust 测试在 debug/release 下均通过；20 个 Python 差分 / 构建缓存回归通过；官方选定套件为 **58 通过、0 失败、0 排除、0 跳过**；Spike 通用 / PMP / 触发器 / 委派四组探针 **225 / 103 / 105 / 53 步**均一致，逐步核对全部整数寄存器及 40 个 CSR 的共有字段；交叉工具链冒烟、格式、Clippy 与 rustdoc 检查通过。
 
 P0 已达成，P1 已满足选定官方套件全通过，受限随机差分验收仍待完成；P2 RTL、P3 模型/RTL 交叉验证未开始。以下勾选表示该项功能或基础设施已实现，不表示完整芯片验收通过。
 
@@ -53,12 +53,13 @@ P0 已达成，P1 已满足选定官方套件全通过，受限随机差分验�
 - [x] 扩充 Spike 差分：独立读取每步 PC、特权级、x0–x31 和 40 个 CSR 的共有字段，覆盖最终状态、CSR 写入效果及 M/S 陷阱入口隐式修改；新增 53 步嵌套委派探针。并非全部 CSR / 所有触发器槽的全量比较。
 - [x] 修复差分假通过：严格检查退出码、超时、退休记录与快照长度；按成功 PC 检查点停止，删除可选 CSR gap 降级。新增 8 个 CLI 回归和 13 个 Python harness 回归，后者接入 CI。
 
+- [x] 固定 Spike 构建：`scripts/spike.lock.json` 锁定完整提交与配置，`scripts/build-spike.sh` 从干净源码构建；缓存按源码 / 脚本 / 主机 ABI / 编译器身份分组并校验二进制摘要。新增 7 个缓存回归；CI 增加 Ubuntu 24.04 的 `spike-difftest` job，以 `--require` 运行四组探针并在失败时保留构建日志。
+
 ## 接下来
 
-固定参考工具版本、扩大到受限随机流；之后推进 C 扩展与最小 RTL。Sv32 与 TVM=1/SUM/MXR 页权限留待地址翻译阶段。
+扩大到受限随机流；之后推进 C 扩展与最小 RTL。Sv32 与 TVM=1/SUM/MXR 页权限留待地址翻译阶段。
 
 - [ ] 收敛差分测试的程序集。`scripts/difftest.S` 刻意避开了两类行为：非对齐数据访问（Spike 陷阱、模型完成，**两者都合规**，而一条分歧指令会使其后每一条都错位）与取值由实现决定的寄存器（`misa` 报告扩展位，`cycle`/`time`/`instret` 的值只在各自机器上有意义）。每排除一类都缩小了覆盖，因此需要更多程序来补上——这也是「受限随机的指令生成」的前提。
-- [ ] 为差分 harness 固定 Spike 的构建方式。Spike **不在 Ubuntu apt 源中**，本环境从源码构建（`riscv-isa-sim`，依赖 autoconf/gmp/mpc/dtc）；注意**代理内核 `pk` 已从 riscv-isa-sim 中移除**，因此 Spike 内建 HTIF 与 `riscv-tests` 的 `tohost` 约定并不相同——这正是 `scripts/difftest.S` 用自旋地址而非 `tohost` 报告结果的原因。
 
 ## 之后
 
@@ -77,5 +78,5 @@ P0 已达成，P1 已满足选定官方套件全通过，受限随机差分验�
 - 注意默认 `make` **不构建代理内核 `pk`**，且 `pk` 已被移出 riscv-isa-sim，因此 Spike 内建 HTIF 与 `riscv-tests` 的 `tohost` 约定不同：Spike 会把 `tohost` 的高字节当作 syscall 号。差分测试因此不使用 `tohost` 报告结果。
 - 182 个 Rust 测试不依赖任何外部工具，`cargo test --all-targets` 即可全部运行。但它们使用手工编码的指令字，**不**覆盖编译器产生的真实编码——那部分由 `riscv-smoke` 与 `riscv-tests` 验证。
 - `scripts/riscv-tests.sh` 默认克隆到临时目录并在结束时删除。用 `RISCV_TESTS_DIR=/path` 复用已有克隆/构建树时，该目录**永远不会被脚本删除**（这是刻意的：一个脚本不应删除调用者指定的目录）。本环境的复用目录是 `/tmp/opencode/rt`。
-- `scripts/difftest.sh` **不属于门禁**：当前 CI 未配置 Spike 的固定版本构建与缓存。缺 Spike 时该脚本打印 `SKIP` 并以 0 退出；`--require` 可让缺失变成失败。
+- `scripts/difftest.sh` 已接入 CI 的 `spike-difftest` job，使用固定提交构建与缓存。可用 `SPIKE=$(bash scripts/build-spike.sh)` 复现；本地未指定 Spike 且 PATH 中缺失时仍打印 `SKIP`，`--require` 则失败。
 - 当前 `riscv-tests` 成绩：**58 通过、0 失败、0 excluded**，全部选定程序均纳入门禁。

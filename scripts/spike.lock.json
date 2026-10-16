@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/riscv/riscv-isa-sim.git",
+  "revision": "0bff12123b1fd510e19e19634dd997dbade70e54",
+  "configure": ["--with-boost=no"],
+  "cc": "gcc",
+  "cxx": "g++",
+  "cflags": "-O2",
+  "cxxflags": "-O2",
+  "target": "spike"
+}

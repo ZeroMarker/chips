@@ -8,7 +8,7 @@ name: CI
 #
 # What CI still cannot check is the ROADMAP P3 acceptance criterion proper:
 # comparing the model against a hardware RTL peer, with Spike as an external
-# reference. Local Spike differential testing exists, but is not a CI gate.
+# reference. Spike differential testing is gated below with a locked build.
 # RTL and its Verilator harness do not exist yet; see docs/TODO.md.
 
 on:
@@ -132,3 +132,48 @@ jobs:
       # this required check fail.
       - name: Build and run rv32ui-p-* and rv32mi-p-*
         run: bash scripts/riscv-tests.sh --require
+
+  spike-difftest:
+    name: Spike differential tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install host build tools and RISC-V cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential git device-tree-compiler libgmp-dev libmpc-dev \
+            gcc-riscv64-unknown-elf
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Compute Spike cache identity
+        id: spike-key
+        run: |
+          SPIKE_CACHE_KEY=$(bash scripts/build-spike.sh --cache-key)
+          echo "key=$SPIKE_CACHE_KEY" >> "$GITHUB_OUTPUT"
+
+      # No restore-keys fallback: source, recipe, host ABI and compiler identity
+      # must match. The builder also verifies provenance and the binary digest.
+      - uses: actions/cache@v4
+        with:
+          path: target/tools/spike/${{ steps.spike-key.outputs.key }}
+          key: spike-${{ runner.os }}-${{ runner.arch }}-${{ steps.spike-key.outputs.key }}
+
+      - name: Build or verify locked Spike and run all four probes
+        run: |
+          SPIKE=$(bash scripts/build-spike.sh --jobs 2)
+          export SPIKE
+          bash scripts/difftest.sh --require -v
+
+      - name: Preserve Spike build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike-build-logs
+          path: target/tools/spike/*.log
+          if-no-files-found: ignore

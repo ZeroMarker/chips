@@ -272,7 +272,7 @@ CPU 在取指和每次 load/store 调用后备内存之前检查 PMP。MPRV=1 �
 
 `scripts/riscv-tests.sh` 已删除排除清单，当前选定的 58 个程序全部执行；任一失败都会令脚本以非零码退出。
 
-`scripts/difftest.sh` 是可选的第三重安全网：与 Spike 逐步比对 PC、指令字、目的寄存器值与内存写入。它**不属于门禁**——Spike 不在 apt 源中，当前 CI 未配置 Spike 的固定版本构建与缓存；缺 Spike 时它打印 `SKIP` 并以 0 退出，`--require` 可让缺失变成失败。
+`scripts/difftest.sh` 是第三重安全网：比较退休效果及逐步真实架构状态。CI 的 `spike-difftest` job 从锁定源码构建或校验缓存，并以 `--require` 运行四组探针。本地缺 Spike 时仍可跳过；CI 中缺失或构建失败会令 job 失败。
 
 ## 10. 逐指令 trace
 
@@ -329,9 +329,11 @@ Spike 通过 `-d --debug-cmd` 执行相同步数的 `rs 1`，每步分别查询 
 
 Spike reset 默认把 PMP 第零项设为全放行，模型默认全 OFF。四组探针先执行 `csrw pmpcfg0, zero` 和 `csrw pmpaddr0, zero`，再从显式符号 `difftest_start` 开始比较全部状态。这两条初始化指令仍参与退休记录比较；没有该符号的自定义 ELF 从复位状态开始比对，不隐藏默认 PMP 差异。
 
-模型 `--stop-pc` 在执行成功地址前停止；未到达目标则失败。Spike 严格执行相同步数再正常退出，程序不执行末尾自旋。任意非零退出、超时、状态读取缺失、多余数据、退休记录数量不同或状态分歧均失败，不再将可选 CSR 分歧归类为 gap。`--timeout` 默认每个命令 30 秒；`--budget` 默认 2000 步。13 个 Python 回归在 CI 验证解析、长度检查及故障路径；实际 Spike 差分尚未成为 CI 门禁。
+模型 `--stop-pc` 在执行成功地址前停止；未到达目标则失败。Spike 严格执行相同步数再正常退出，程序不执行末尾自旋。任意非零退出、超时、状态读取缺失、多余数据、退休记录数量不同或状态分歧均失败，不再将可选 CSR 分歧归类为 gap。`--timeout` 默认每个命令 30 秒；`--budget` 默认 2000 步。13 个 Python 回归在 CI 验证解析、长度检查及故障路径；另有 7 个构建缓存回归。实际 Spike 差分也已接入独立 CI job。
 
 当前四组分别执行 225 / 103 / 105 / 53 步，退休 224 / 100 / 101 / 51 条，比较 224 / 102 / 104 / 52 个状态（从两条 PMP 初始化后的状态开始，含最终状态）。新增 `delegation.S` 验证 U→S 委派 ECALL、嵌套 S→M ECALL，以及 MRET/SRET 返回 U。
+
+参考 Spike 由 `scripts/spike.lock.json` 锁定提交 `0bff12123b1fd510e19e19634dd997dbade70e54` 与配置。构建器 `scripts/build_spike.py` 按完整 SHA 获取源码，只生成 `spike` 可执行文件；构建成功且确认支持调试命令和提交日志后才发布缓存。缓存键含 lock、脚本摘要、系统 / 架构 / libc 及编译器 / 链接器身份；`build.json` 保存这些信息与二进制 SHA-256，命中时重新校验。失败或中断不发布半成品；损坏条目直接失败，不静默使用。CI 缓存不使用模糊回退，构建日志失败时上传为 artifact。此流程固定源码与配置，不承诺跨宿主机逐字节可复现。
 
 ## 12. 已知限制
 
@@ -340,7 +342,7 @@ Spike reset 默认把 PMP 第零项设为全放行，模型默认全 OFF。四�
 1. **原生触发器仅实现基础地址匹配**。`breakpoint`、`pmpaddr`、`illegal` 已全部纳入门禁，但外部调试、type-6 与高级触发功能未实现；PMP 的 Smepmp 增强也未实现。
 2. **无地址转换**。仅 Bare，`satp`/TVM/SUM/MXR 读零；选择不实现 `SFENCE.VMA` 并产生非法指令异常。引入 Sv32 时需要配套页表遍历、权限和 TVM 门控。
 3. **无 PLIC**。平台目前只有 CLINT，尚无外部中断控制器；S 级外部/定时器中断可由 M 软件注入。
-4. **差分尚无随机流及全部状态覆盖**。四组定向探针已核对每步完整整数寄存器与 40 个 CSR 的共有字段；计数器、设备 pending、能力字段及所有触发器槽的同时快照尚未纳入。Spike 固定版本构建与缓存仍待实现。
+4. **差分尚无随机流及全部状态覆盖**。四组定向探针已核对每步完整整数寄存器与 40 个 CSR 的共有字段；计数器、设备 pending、能力字段及所有触发器槽的同时快照尚未纳入。参考工具的源码和配置已锁定，系统依赖仍由宿主机提供。
 
 本次特权语义依据固定版本的官方手册：[Machine-Level ISA v1.13](https://docs.riscv.org/reference/isa/v20260120/priv/machine.html)（委派、中断、TSR、PMP 与 MPRV）及 [Supervisor-Level ISA v1.13](https://docs.riscv.org/reference/isa/v20260120/priv/supervisor.html)（CSR 视图、Bare 与 SFENCE.VMA）。
 
