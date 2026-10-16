@@ -8,7 +8,8 @@ name: CI
 #
 # What CI still cannot check is the ROADMAP P3 acceptance criterion proper:
 # comparing the model against a hardware RTL peer, with Spike as an external
-# reference. No Spike, QEMU, Verilator, or RTL exists yet; see docs/TODO.md.
+# reference. Local Spike differential testing exists, but is not a CI gate.
+# RTL and its Verilator harness do not exist yet; see docs/TODO.md.
 
 on:
   push:
@@ -123,9 +124,10 @@ jobs:
 
       # This is the ROADMAP P0/P1 acceptance criterion: the official rv32ui and
       # rv32mi suites running on the model, reporting through the tohost
-      # convention. Two tests are reported as excluded rather than passed,
+      # convention. Three tests are reported as excluded rather than passed,
       # because they need facilities the model does not implement (the debug
-      # trigger module and PMP); the script names them and fails on anything
-      # else, so a real regression cannot hide behind them.
+      # trigger module, PMP, and trap delegation with related privilege fields).
+      # The script names them and fails on anything else, so a real regression
+      # cannot hide behind them.
       - name: Build and run rv32ui-p-* and rv32mi-p-*
         run: bash scripts/riscv-tests.sh --require

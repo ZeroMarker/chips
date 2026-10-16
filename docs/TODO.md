@@ -2,13 +2,19 @@
 
 Rust 黄金参考模型及其未来 RTL 对应实现的工作台账。条目按依赖关系与验证价值排序；项目里程碑见 [`ROADMAP.md`](ROADMAP.md)，模型设计见 [`ARCHITECTURE.md`](ARCHITECTURE.md)。
 
+## 当前状态
+
+2026-10-16 本地复测：139 个 Rust 测试在 debug/release 下均通过；官方选定套件为 **55 通过、0 失败、3 排除、0 跳过**；Spike 自带探针的 **225 步程序一致**（比较记录共 1999 条，含末尾自旋）；交叉工具链冒烟、格式、Clippy 与 rustdoc 检查通过。
+
+P0 已达成，P1 大部分实现但尚未满足全套通过与随机差分验收；P2 RTL、P3 模型/RTL 交叉验证未开始。以下勾选表示该项功能或基础设施已实现，不表示完整芯片验收通过。
+
 ## 已完成
 
 - [x] 执行 RV32I 基础整数指令集。
 - [x] 执行 RV32M 乘除扩展（含除零与有符号最小值除 `-1` 的边界语义）。
 - [x] 实现全部六条 Zicsr 读改写指令。
 - [x] 拒绝写入架构上只读的 CSR。
-- [x] 陷阱化未对齐的取指、加载与存储地址。
+- [x] 陷阱化未对齐的取指与跳转目标；非对齐数据加载/存储选择完成访问，并有回归测试。
 - [x] 拒绝保留的移位、`jalr`、`fence` 与 SYSTEM 编码。
 - [x] 通过 RV32 低/高 CSR 对暴露可用的 64 位 `cycle` 与 `instret` 计数器。
 - [x] 经 `mtvec`、`mepc`、`mcause`、`mtval` 将同步异常路由到机器级陷阱入口；已安装处理程序时 `ecall`/`ebreak` 同样进入。
@@ -23,7 +29,7 @@ Rust 黄金参考模型及其未来 RTL 对应实现的工作台账。条目按�
 - [x] 文档结构重整：文档统一为中文，路线图/清单/背景参考移入 `docs/`，交叉引用与代码注释同步更新。
 - [x] 给内存模型加入解码后的地址映射与访问故障（`InstructionAccessFault`/`LoadAccessFault`/`StoreAccessFault`），并为 RAM 提供 O(1) 的平坦后备（`src/mem.rs`、`tests/memory.rs`）。
 - [x] 实现 HTIF `tohost`/`fromhost` 协议与 `riscv-tests` 目标平台定义（`src/htif.rs`、`src/platform.rs`）。
-- [x] 把工具链冒烟测试扩展为真正的 `riscv-tests` runner：`scripts/riscv-tests.sh` 克隆、配置（XLEN=32）、构建并运行 `rv32ui-p-*`/`rv32mi-p-*`，经 `--htif` 读取 `tohost` 判定 pass/fail。**58 个测试中 56 个通过，2 个 excluded。**
+- [x] 把工具链冒烟测试扩展为真正的 `riscv-tests` runner：`scripts/riscv-tests.sh` 克隆、配置（XLEN=32）、构建并运行 `rv32ui-p-*`/`rv32mi-p-*`，经 `--htif` 读取 `tohost` 判定 pass/fail。**58 个测试中 55 个通过，0 个失败，3 个 excluded。**
 - [x] 将 `riscv-tests` 接入 CI（`riscv-tests` job）。
 - [x] 修正两处由官方套件暴露的架构缺陷：写入 `minstret` 必须抑制该指令自身的计数增量（`instret_overflow`）；非对齐**数据**访问应当完成而非陷阱（`ma_data`）。
 - [x] 实现中断交付：新增 CLINT（`msip`/`mtimecmp`/`mtime`，SiFive FE310 布局，`src/clint.rs`），`mip` 由设备驱动且对软件只读，`time`/`timeh` 跟随 CLINT；中断在步骤边界交付，`mcause` 为中断位本身，向量化 `mtvec` 首次真正生效（`tests/interrupts.rs`，19 个测试）。
@@ -33,11 +39,11 @@ Rust 黄金参考模型及其未来 RTL 对应实现的工作台账。条目按�
 
 ## 接下来
 
-按依赖顺序：前三项是解锁 `rv32mi-p-illegal` 的条件，第四项扩大差分覆盖，最后一项面向 RTL。
+优先补齐特权与陷阱语义及官方套件排除项，再扩大差分覆盖、固定参考工具版本；之后推进 C 扩展与最小 RTL。
 
 - [ ] 实现**陷阱委派**（`medeleg`/`mideleg`），并按委派把陷阱路由到 `stvec` 而非 `mtvec`。这是 `rv32mi-p-illegal` 被列为 excluded 的直接原因：模型现在有 S/U 特权级，该测试的探测不再短路，于是会继续走 `mideleg`、向量化的监管级中断、以及 `TVM`/`TSR`/`SUM`/`MXR` 的门控路径。相关联地还需要：
-  - [ ] `mstatus.TVM`/`TSR`——在 M 级屏蔽 `sfence.vma` 与 `satp` 访问、在 S 级屏蔽 `sret`。
-  - [ ] `sstatus.SUM`/`MXR`——S 级是否可访问 U 页面的内存、以及是否可取指令页。两者都可报告为不支持，但必须**显式**报告而不是让 `sret`/`sfence.vma` 静默非法。
+  - [ ] `mstatus.TVM`/`TSR`——补齐从 M 级配置、对 S 级 `sfence.vma`/`satp` 访问和 `sret` 生效的门控。
+  - [ ] `sstatus.SUM`/`MXR`——明确支持范围、字段读写与页访问权限语义；与未来地址翻译实现配套验证。当前 `satp` 仅支持 Bare。
   - [ ] S 级中断交付：被委派的 MSI/SEI 经 `stvec` 进入，含向量模式。
 - [ ] 补齐 `rv32mi-p-pmpaddr` 所需的物理内存保护（`pmpcfg0`/`pmpaddr0-15`）与 `rv32mi-p-breakpoint` 所需的调试触发模块（`tcontrol`/`tselect`/`tdata1-3`）。两者当前是 excluded 而非通过，理由写在 `scripts/riscv-tests.sh` 的注释里。
 - [ ] 扩充差分比较的范围。当前 `scripts/difftest.sh` 只比较**已退休**的指令——这是 Spike 提交日志唯一记录的东西——因此 CSR 写入完全不在交集内。补充比较最终架构状态（全部寄存器 + 可读 CSR）与 CSR 写入序列，才能覆盖 trap 入口的 `mepc`/`mcause`/`mtval` 写入。
@@ -49,7 +55,7 @@ Rust 黄金参考模型及其未来 RTL 对应实现的工作台账。条目按�
 - [ ] 实现压缩 `C` 扩展以达成 RV32IMC 目标配置。`Trap::Unsupported("C")` 已能在遇到该编码时报告。
 - [ ] 构建第一颗单周期 RTL 核并与本模型对比。
 - [ ] 添加受限随机的指令生成与基于 Spike 的差分测试。
-- [ ] 添加总线、boot ROM、RAM、UART 与中断控制器模型以支持 SoC 集成，并以 CLINT `mtime` 取代模型时间基。
+- [ ] 在现有 RAM 地址映射与 CLINT 基础上补齐总线、boot ROM、UART、PLIC 与裸机运行时，验证 C / Rust `no_std` 程序启动。CLINT 已提供平台时间基；无 CLINT 的地址空间保留模型计数器作为后备。
 
 ## 本地环境说明
 
@@ -61,5 +67,5 @@ Rust 黄金参考模型及其未来 RTL 对应实现的工作台账。条目按�
 - 注意默认 `make` **不构建代理内核 `pk`**，且 `pk` 已被移出 riscv-isa-sim，因此 Spike 内建 HTIF 与 `riscv-tests` 的 `tohost` 约定不同：Spike 会把 `tohost` 的高字节当作 syscall 号。差分测试因此不使用 `tohost` 报告结果。
 - 139 个 Rust 测试不依赖任何外部工具，`cargo test --all-targets` 即可全部运行。但它们使用手工编码的指令字，**不**覆盖编译器产生的真实编码——那部分由 `riscv-smoke` 与 `riscv-tests` 验证。
 - `scripts/riscv-tests.sh` 默认克隆到临时目录并在结束时删除。用 `RISCV_TESTS_DIR=/path` 复用已有克隆/构建树时，该目录**永远不会被脚本删除**（这是刻意的：一个脚本不应删除调用者指定的目录）。本环境的复用目录是 `/tmp/opencode/rt`。
-- `scripts/difftest.sh` **不属于门禁**：Spike 不在 apt 源中，把它设为 CI 必需项意味着每次运行都要从源码构建。缺 Spike 时该脚本打印 `SKIP` 并以 0 退出；`--require` 可让缺失变成失败。
+- `scripts/difftest.sh` **不属于门禁**：当前 CI 未配置 Spike 的固定版本构建与缓存。缺 Spike 时该脚本打印 `SKIP` 并以 0 退出；`--require` 可让缺失变成失败。
 - 当前 `riscv-tests` 成绩：**55 通过、0 失败、3 excluded**（`rv32mi-p-breakpoint`、`rv32mi-p-illegal`、`rv32mi-p-pmpaddr`）。排除理由写在 `scripts/riscv-tests.sh` 的注释中。

@@ -71,7 +71,7 @@
 
 **验收**：`rv32ui-p-*`、`rv32mi-p-*` 全绿；随机指令流下与 Spike 结果一致。
 
-**当前状态**：模型侧已完成 `RV32IMZicsr`（`src/isa.rs` 译码、`src/cpu.rs` 执行、`src/csr.rs` CSR 语义、`src/mem.rs` 解码地址映射）、M/S/U 三级特权与陷阱进入、中断交付与 CLINT、139 个 Rust 测试。**`rv32ui-p-*` 42/42 通过；`rv32mi-p-*` 13/16 通过**，3 个因设施未实现而排除（`breakpoint` 需调试触发模块、`pmpaddr` 需 PMP、`illegal` 需陷阱委派与 `TVM`/`TSR`/`SUM`/`MXR`），理由写在 `scripts/riscv-tests.sh`。官方套件前后暴露并修正四处语义缺陷（`minstret` 写入抑制、非对齐数据访问完成而非陷阱、`csr[9:8]` 特权表方向、以及陷阱入口把 `MPP` 掩码当成值写入），说明它比手写测试更容易发现偏差。**Spike 差分已建立并通过**：`scripts/difftest.sh` 对 `scripts/difftest.S` 的 225 步程序逐步比较 PC、指令字、目的寄存器值与内存写入，两侧完全一致。详见 [`ARCHITECTURE.md`](ARCHITECTURE.md) 与 [`TODO.md`](TODO.md)。
+**当前状态**：**大部分实现，尚未完成本阶段验收**（仍有 3 项排除，受限随机指令流差分尚未建立）。模型侧已完成 `RV32IMZicsr`（`src/isa.rs` 译码、`src/cpu.rs` 执行、`src/csr.rs` CSR 语义、`src/mem.rs` 解码地址映射）、M/S/U 三级特权与陷阱进入、中断交付与 CLINT、139 个 Rust 测试。**`rv32ui-p-*` 42/42 通过；`rv32mi-p-*` 13/16 通过**，3 个因设施未实现而排除（`breakpoint` 需调试触发模块、`pmpaddr` 需 PMP、`illegal` 需陷阱委派与 `TVM`/`TSR`/`SUM`/`MXR`），理由写在 `scripts/riscv-tests.sh`。官方套件前后暴露并修正四处语义缺陷（`minstret` 写入抑制、非对齐数据访问完成而非陷阱、`csr[9:8]` 特权表方向、以及陷阱入口把 `MPP` 掩码当成值写入），说明它比手写测试更容易发现偏差。**Spike 差分已建立并通过**：`scripts/difftest.sh` 对 `scripts/difftest.S` 的 225 步程序逐步比较 PC、指令字、目的寄存器值与内存写入，两侧完全一致。详见 [`ARCHITECTURE.md`](ARCHITECTURE.md) 与 [`TODO.md`](TODO.md)。
 
 ---
 
@@ -86,7 +86,7 @@
 
 **验收**：单周期核通过 `rv32ui-*`/`rv32mi-*`；RTL 综合可用（yosys 不报严重时序/占用错误即可）。
 
-**当前状态**：未开始。本仓库当前无 RTL；P2 的第一步是 P1 的 `riscv-tests` runner 就位。
+**当前状态**：未开始。本仓库当前无 RTL；P1 的 `riscv-tests` runner 已就位；下一步是实现最小单周期 RV32I 核，并接入 Verilator 与同一批测试程序。
 
 ---
 
@@ -108,11 +108,11 @@
 
 **验收**：随机生成的数千指令流下，两轨道状态 100% 一致；至少一处真实缺陷（如对不齐、符号扩展）被差分测试捕获。
 
-**当前状态**：未开始（RTL 尚不存在），但**两侧的前置条件均已就位**。
+**当前状态**：模型/RTL 交叉验证未开始（RTL 尚不存在）。模型侧已有稳定 trace 和 Spike 定向差分；RTL 提交状态接口、双轨 harness 与随机激励仍待实现。
 
 模型侧的每指令 trace 格式已冻结（`src/trace.rs`）：每步一行，`i`/`t`/`x` 三种记录，语法在代码中显式规定并由 `tests/trace.rs` 逐字锁定——格式先于 RTL 确定，否则 RTL 侧会被迫适配未冻结的格式。刻意不含周期数（模型一步一条、RTL 不是）与内存读（读不改状态，未命中已表现为取访问故障）。
 
-模型 vs Spike 的差分已跑通（`scripts/difftest.sh`）：逐步比较 PC、指令字、目的寄存器与其值、内存写入的地址与值，只比较**已退休**的指令，因为 Spike 提交日志仅记录这些。当前比较范围的两处已知收缩记录在 [`TODO.md`](TODO.md) 的 Next：CSR 写入不在交集内，以及差分程序必须避开实现自定的行为（非对齐数据访问——Spike 陷阱而模型完成，两者都合规；以及 `misa`/计数器等取值由实现决定的寄存器）。
+模型 vs Spike 的差分已跑通（`scripts/difftest.sh`）：逐步比较 PC、指令字、目的寄存器与其值、内存写入的地址与值，只比较**已退休**的指令，因为 Spike 提交日志仅记录这些。当前比较范围的两处已知收缩记录在 [`TODO.md`](TODO.md) 的「接下来」：CSR 写入不在交集内，以及差分程序必须避开实现自定的行为（非对齐数据访问——Spike 陷阱而模型完成，两者都合规；以及 `misa`/计数器等取值由实现决定的寄存器）。
 
 ---
 

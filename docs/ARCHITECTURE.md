@@ -170,7 +170,7 @@ CSR 的正确性集中在三件事，缺一不可。
 
 ### 存在性
 
-`Csr::exists()` 白名单列出本模型实现的 22 个地址。访问白名单外的地址 → `IllegalInstruction`。这样未实现的 CSR 会明确报错，而不是静默读 0。
+`Csr::exists()` 白名单列出本模型支持的 CSR 地址，涵盖非特权计数器、监管级状态与陷阱寄存器、机器级状态与计数器。存在性只表示可访问，不表示相关设施已完整实现（例如 `satp` 仅支持 Bare）。访问白名单外的地址 → `IllegalInstruction`。这样未实现的 CSR 会明确报错，而不是静默读 0。
 
 ### 特权
 
@@ -192,17 +192,17 @@ CSR 的正确性集中在三件事，缺一不可。
 
 | CSR | 合法化规则 |
 |-----|-----------|
-| `mstatus` | 仅保留 `MIE`/`MPIE`/`MPP`；`MPP` 恒为 M（唯一实现的模式），其余位读 0 |
+| `mstatus` | 保留 `SIE`/`MIE`/`SPIE`/`MPIE`/`SPP`/`MPP`；`MPP` 支持 M/S/U，保留编码合法化为 U，其余位读 0 |
 | `mtvec` | mode 0/1 保留，保留值 2/3 合法化为 0；基址天然 4 字节对齐 |
 | `mepc` | 屏蔽最低两位（IALIGN = 32） |
-| `mie` | 仅保留 MEIE(11)/MTIE(7)/MSIE(3)——S/U 模式不存在 |
+| `mie` | 仅保留 MEIE(11)/MTIE(7)/MSIE(3)；虽有 S/U 特权级，当前尚无 S 级中断交付 |
 | `misa` | 常量 `0x40001100`（MXL=1，扩展 I 与 M；Zicsr 由基础隐含，无 `misa` 位） |
 
 ### 计数器与时间
 
 `cycle`/`mcycle`/`instret`/`minstret`（及 `*H` 高半、`cycle`/`time`/`instret` 非特权只读别名）在 `csr.rs` 中登记为存在但**不占存储**，由 `Cpu::read_csr`/`write_csr` 从 CPU 状态提供：机器级计数器可写，非特权别名不可写（`cpu::execute_csr` 先拒绝）。
 
-`time`/`timeh` 读模型时间基（每步加一）。真实 hart 从中断控制器的内存映射 `mtime` 读取，那属于 SoC 阶段。
+`time`/`timeh` 在带 CLINT 的地址空间中读取 CLINT `mtime`，CLINT 同时提供内存映射访问；CPU 每步采样后推进设备时间基。无 CLINT 时才退回模型自己的每步计数器。
 
 ## 6. Zicsr 指令语义
 
@@ -264,11 +264,11 @@ CSR 的正确性集中在三件事，缺一不可。
 
 ### 官方套件
 
-上述不变量之外，`scripts/riscv-tests.sh` 跑官方 `rv32ui-p-*` 与 `rv32mi-p-*`，**55 通过、0 失败、3 excluded**。它比任何手写测试都更容易发现语义偏差——本项目中被它抓出的三处（`minstret` 抑制、非对齐数据访问、以及它自己暴露出来的 `csr[9:8]` 特权表方向）都不是靠推理想到的。修改执行语义后应先跑它。
+上述不变量之外，`scripts/riscv-tests.sh` 跑官方 `rv32ui-p-*` 与 `rv32mi-p-*`，**55 通过、0 失败、3 excluded**。它比任何手写测试都更容易发现语义偏差——本项目中被它抓出的四处（`minstret` 抑制、非对齐数据访问、`csr[9:8]` 特权表方向、陷阱入口的 `MPP` 写入）都不是靠推理想到的。修改执行语义后应先跑它。
 
 被排除的三项写进 `scripts/riscv-tests.sh` 的注释并说明缺什么，而不是当作通过：这样表头的数字才有意义，被支持的测试里出回归也不会被淹没。
 
-`scripts/difftest.sh` 是可选的第三重安全网：与 Spike 逐步比对 PC、指令字、目的寄存器值与内存写入。它**不属于门禁**——Spike 不在 apt 源中，设为 CI 必需项意味着每次运行都要从源码构建；缺 Spike 时它打印 `SKIP` 并以 0 退出，`--require` 可让缺失变成失败。
+`scripts/difftest.sh` 是可选的第三重安全网：与 Spike 逐步比对 PC、指令字、目的寄存器值与内存写入。它**不属于门禁**——Spike 不在 apt 源中，当前 CI 未配置 Spike 的固定版本构建与缓存；缺 Spike 时它打印 `SKIP` 并以 0 退出，`--require` 可让缺失变成失败。
 
 ## 10. 逐指令 trace
 
